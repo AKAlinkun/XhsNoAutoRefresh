@@ -24,15 +24,19 @@ static BOOL kShowAlert    = YES;    // v1.0.0 诊断版：切回前台弹一次�
 static BOOL kProbeTrigger = YES;    // 记录刷新来源（哪个页面 + 调用栈）
 
 // 安全阀（逻辑是「任何异常情况一律放行」）
-static BOOL   kStartupGrace      = YES;   // 阀①
-static double kStartupGraceSecs  = 1.5;   // ★ 故意很短：B站那套 20 秒在这里会正好放过你要拦的那次
+// ★ 阀① 默认【关闭】：用户实测「打开小红书直接就刷新了」→ 这次刷新发生在启动后 1~2 秒内，
+//   而 1.5 秒的启动宽限正好可能把它放过。首屏安全已经由阀②（空列表放行）负责，阀① 是多余的。
+//   想重新打开就把下面改成 YES、秒数填上即可。
+static BOOL   kStartupGrace      = NO;
+static double kStartupGraceSecs  = 0.0;
 static BOOL   kSkipWhenEmptyView = YES;   // 阀②：列表还没内容 → 这是首屏加载，放行（★ 本插件的关键一条）
 static BOOL   kBreakRetryLoop    = YES;   // 阀③
 static double kCooldownSecs      = 30.0;
 
-// ★ 用「前缀」而不是全等：万一包名有 .dev / .enterprise 之类的变体也不会失效
+// ★ v1.0.1：包名不再作为「装不装」的硬开关（见 XNRInstallWhenReady 注释）。
+//   这里只用于日志和弹窗展示，方便一眼核对是不是目标 App。
 static const char *kTargetBundlePrefix = "com.xingin.";
-static const char *kVersion            = "1.0.0";
+static const char *kVersion            = "1.0.1";
 
 static const NSInteger kStatePulling = 2;
 
@@ -123,6 +127,7 @@ static int  gAllowNoInfo = 0;    // 拿不到判断依据（宁可漏拦）
 
 static BOOL gInstalled = NO;
 static int  gInstallTries = 0;   // 第几轮尝试安装（用于日志与重试上限）
+static NSString *gRealBundleID = nil;   // ★ 本进程真实包名 —— 排障第一信息，直接打进弹窗
 
 static NSTimeInterval gStartTime     = 0;
 static NSTimeInterval gLastAllow     = 0;
@@ -138,7 +143,8 @@ static NSMutableArray *gHookedNames = nil;
 static NSMutableArray *gFound       = nil;
 static NSTimeInterval  gFoundLast   = 0;
 
-static void XNRShowStats(void);   // 前置声明（定义在后面）
+static BOOL XNRPresentStats(void);      // 前置声明（定义在后面）
+static void XNRStatsRetry(int tries);   // 前置声明
 
 #pragma mark - 刷新控件判定（★ 只有 XNRIsFooter 允许在后台线程调用）
 
@@ -501,34 +507,47 @@ static BOOL XNRCanPresent(void) {
     } @catch (NSException *e) { (void)e; return NO; }
 }
 
-static void XNRAlert(NSString *title, NSString *msg, NSString *btn) {
-    if (!kShowAlert) return;
-    if (![NSThread isMainThread]) return;
-    if (!XNRCanPresent()) return;
+static BOOL XNRAlert(NSString *title, NSString *msg, NSString *btn) {
+    if (!kShowAlert) return NO;
+    if (![NSThread isMainThread]) return NO;
+    if (!XNRCanPresent()) return NO;
     @try {
         UIAlertController *a = [UIAlertController alertControllerWithTitle:title
                                                                   message:msg
                                                            preferredStyle:UIAlertControllerStyleAlert];
         [a addAction:[UIAlertAction actionWithTitle:btn style:UIAlertActionStyleDefault handler:nil]];
         [XNRRootVC() presentViewController:a animated:YES completion:nil];
-    } @catch (NSException *e) { (void)e; }
+        return YES;
+    } @catch (NSException *e) { (void)e; return NO; }
 }
 
-static void XNRShowStats(void) {
+// 返回 YES = 已经不需要再试了（弹成功 / 或本来就不需要弹）
+static BOOL XNRPresentStats(void) {
+    if (!kShowAlert) return YES;                     // 关掉了，没什么可重试
+    if (gStartTime <= 0) return NO;
+    if (XNRNow() - gStartTime < 10.0) return NO;     // 启动 10 秒内不打扰
+    if (!XNRCanPresent()) return NO;                 // 不在稳定态 → 稍后重试
+
     @try {
-        // ★ 弹窗由 kShowAlert 控制；即使不弹窗，也照样把统计写进日志文件，
-        //   这样「日常无打扰」和「留一条排障痕迹」可以兼得。
-        if (gStartTime <= 0) return;
-        if (XNRNow() - gStartTime < 15.0) return;    // 启动 15 秒内不打扰
-
-        NSString *cls   = gHookedNames.count ? [gHookedNames componentsJoinedByString:@"\n"] : @"(一个都没挂钩上!)";
+        NSString *cls   = gHookedNames.count ? [gHookedNames componentsJoinedByString:@"\n"] : @"(没找到任何 -beginRefreshing 实现)";
         NSString *hints = gFound.count ? [gFound componentsJoinedByString:@"\n\n"] : @"(还没捕捉到 —— 从装上到现在一次都没拦到过)";
-        NSString *valve = [NSString stringWithFormat:@"启动宽限剩 %.1fs%@%@",
-                           MAX(0.0, kStartupGraceSecs - (XNRNow() - gStartTime)),
-                           (gCooldownUntil > XNRNow()) ? @"·熔断中" : @"",
-                           gCooldownHit ? [NSString stringWithFormat:@"·熔断过 %d 次", gCooldownHit] : @""];
+        NSString *valve = kStartupGrace
+            ? [NSString stringWithFormat:@"启动宽限剩 %.1fs%@%@",
+               MAX(0.0, kStartupGraceSecs - (XNRNow() - gStartTime)),
+               (gCooldownUntil > XNRNow()) ? @"·熔断中" : @"",
+               gCooldownHit ? [NSString stringWithFormat:@"·熔断过 %d 次", gCooldownHit] : @""]
+            : [NSString stringWithFormat:@"启动宽限: 关（空列表放行 %@）%@",
+               kSkipWhenEmptyView ? @"开" : @"关",
+               gCooldownHit ? [NSString stringWithFormat:@"·熔断过 %d 次", gCooldownHit] : @""];
 
-        // ★★ 这一行是 v1.0.0 最要紧的数据：它直接告诉你「你要拦的那次刷新发生在启动后几秒」
+        // ★★ v1.0.1 新增：把「本进程真实包名」摆在最上面 —— 排障第一信息
+        NSString *tgt   = [NSString stringWithUTF8String:kTargetBundlePrefix];
+        NSString *bidLn = [NSString stringWithFormat:@"%@%@  (目标前缀 %@)",
+                           gRealBundleID ?: @"(还没取到)",
+                           (gRealBundleID && [gRealBundleID hasPrefix:tgt]) ? @"  ✓匹配" : @"  ✗不匹配",
+                           tgt];
+
+        // ★★ 这一行是判断启动宽限该设多少的关键数据
         NSString *first = (gFirstSeenOffset < 0)
             ? @"(还没触发过任何刷新)"
             : [NSString stringWithFormat:@"启动后 %.1f 秒 → %@",
@@ -539,7 +558,8 @@ static void XNRShowStats(void) {
             : @"(还没有)";
 
         NSString *msg = [NSString stringWithFormat:
-            @"挂钩类数: %d    %@\n\n"
+            @"本进程包名\n%@\n\n"
+             "挂钩类数: %d    %@\n\n"
              "beginRefreshing  触发 %d / 放行 %d / 吃掉 %d\n"
              "触发来源          主线程 %d / 后台线程 %d\n"
              "首次触发          %@\n"
@@ -553,6 +573,7 @@ static void XNRShowStats(void) {
              "  拿不到判断依据(放行)     %d\n\n"
              "挂钩的类:\n%@\n\n"
              "被吃掉的刷新（含调用栈）:\n%@",
+            bidLn,
             gHooked, valve,
             gSeenBegin, gAllowBegin, gBlockedBeg,
             gSeenMain, gSeenBG,
@@ -560,24 +581,51 @@ static void XNRShowStats(void) {
             gAllowEmpty, gAllowUser, gAllowGrace, gAllowFooter, gAllowCool, gAllowNoInfo,
             cls, hints];
 
-        XNRLogLine(@"--- 前台统计：钩=%d 见=%d(主%d/后%d) 放行=%d 吃掉=%d 首次@%.1fs",
-                   gHooked, gSeenBegin, gSeenMain, gSeenBG,
-                   gAllowBegin, gBlockedBeg, gFirstSeenOffset);
-
-        XNRAlert([NSString stringWithFormat:@"XhsNoRefresh v%s 统计", kVersion], msg, @"好");
-    } @catch (NSException *e) { (void)e; }
+        BOOL ok = XNRAlert([NSString stringWithFormat:@"XhsNoRefresh v%s 统计", kVersion], msg, @"好");
+        if (ok) {
+            XNRLogLine(@"--- 前台统计：包名=%@ 钩=%d 见=%d(主%d/后%d) 放行=%d 吃掉=%d 首次@%.1fs",
+                       gRealBundleID, gHooked, gSeenBegin, gSeenMain, gSeenBG,
+                       gAllowBegin, gBlockedBeg, gFirstSeenOffset);
+        }
+        return ok;
+    } @catch (NSException *e) { (void)e; return NO; }
 }
+
+// ★ v1.0.1：弹窗不再是一次性尝试 —— 拿不到稳定态就每秒再试一次，最多 5 次。
+//   起因：v1.0.0 只试一次，一旦那一刻正好在转场动画里，弹窗就永远不出现了，
+//        用户看到的就是「装上了却毫无反应」，而这一点点随机性足以让人排查半天。
+static void XNRStatsRetry(int tries) {
+    if (XNRPresentStats()) return;
+    if (tries >= 5) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        XNRStatsRetry(tries + 1);
+    });
+}
+
 
 #pragma mark - 加载入口
 // ⚠️ dyld 阶段只排一个延后任务，绝不碰运行时、绝不弹窗（铁律 2）。
 
 #define XNR_MAX_TRIES 5
 
+// ★★ v1.0.1 修正了一处【把自己取证通道堵死】的设计错误：
+//    v1.0.0 里这里是 `if (![bid hasPrefix:prefix]) return;` —— 包名不匹配就直接返回，
+//    而 gStartTime 只在 XNRInstallGates 里赋值，弹窗又有 `if (gStartTime <= 0) return;`。
+//    结果：包名一旦对不上 → gStartTime 永远是 0 → 弹窗被自己掐死 →
+//    现象变成「明明装上了却什么都不弹、也什么都不拦」，而且无法区分
+//    「Dylib 没加载 / 包名不匹配 / 扫描没找到刷新类」这三种完全不同的原因。
+//    教训：**给用户看的诊断输出，绝不能挂在「目标判定是否通过」下面。**
+//    现在：无论包名是什么都往下走，包名只用于日志与弹窗展示；是否真动手由「扫不扫得到刷新类」决定。
 static void XNRInstallWhenReady(int tries) {
     @try {
-        NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
-        NSString *prefix = [NSString stringWithUTF8String:kTargetBundlePrefix];
-        if (![bid hasPrefix:prefix]) return;    // 只在目标 App 进程内动作
+        if (!gRealBundleID) {
+            gRealBundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"(拿不到)";
+            NSString *tgt = [NSString stringWithUTF8String:kTargetBundlePrefix];
+            XNRLogLine(@"=== 本进程包名: %@  |  目标前缀: %@  |  匹配: %@",
+                       gRealBundleID, tgt,
+                       [gRealBundleID hasPrefix:tgt] ? @"是" : @"否（但这版不再因此中止，继续尝试安装）");
+        }
 
         gInstallTries = tries + 1;
         int n = XNRInstallGates();              // 内部有 gInstalled 守卫，成功过就不会再扫
@@ -603,6 +651,11 @@ __attribute__((constructor))
 static void XNRInit(void) {
     // ★ 构造函数里【只排任务】，绝不扫类表、绝不动运行时（铁律 2）
     @autoreleasepool {
+        // ★★ v1.0.1：gStartTime 在这里就落地，**不再依赖安装是否成功**。
+        //    这样「弹窗能不能弹出来」就与「包名/扫描结果」彻底解耦 ——
+        //    只要 Dylib 被加载了，弹窗就一定会弹，我们才能拿到数据。
+        if (gStartTime <= 0) gStartTime = XNRNow();
+
         dispatch_async(dispatch_get_main_queue(), ^{
             XNRInstallWhenReady(0);
         });
@@ -615,7 +668,7 @@ static void XNRInit(void) {
             (void)note;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
-                XNRShowStats();
+                XNRStatsRetry(0);
             });
         }];
     }
