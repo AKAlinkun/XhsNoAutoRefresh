@@ -34,7 +34,8 @@ def _selftest():
     import tempfile
 
     base = open(DEFAULT, "rb").read().decode("utf-8")
-    cases = []
+    cases = []          # 期望【报错】的变异体
+    clean_cases = []    # ★ 期望【通过】的变异体（防假阳性）—— 见 mutant_clean
     missing = []      # ★ 锚点找不到的用例：**必须判为失败**，见下面 mutant_ok 的说明
 
     def mutant(label, old, new):
@@ -61,6 +62,21 @@ def _selftest():
                 missing.append(label)
                 return
         cases.append((label, t))
+
+    # ★★ v1.0.5：反向测试原来只测"该报的报了没有"，**测不出"不该报的乱报了"**。
+    #   而本项目栽在假阳性上的次数并不比漏报少：
+    #     规则 13 第一版报 42 处假阳性（ObjC 相邻字面量拼接）、
+    #     `#pragma mark` 里的中文引号被当成字符串、
+    #     规则 6 的 `.*?\n};` 遇到同行闭合的 static 数组就吞到几百行外、
+    #     规则 14 把三元运算符 `? :` 的冒号当成选择器冒号。
+    #   假阳性比漏报更危险：它会**逼着人把本来正确的代码改坏**，而且改完就"绿了"，没人知道是规则错。
+    #   所以补这一类用例：这些变异体**必须 exit 0**。
+    def mutant_clean(label, old, new):
+        if old not in base:
+            print("  ✗ 锚点没找到（这条「不许误报」的测试已经失效）：%s" % label)
+            missing.append(label)
+            return
+        clean_cases.append((label, base.replace(old, new, 1)))
 
     mutant_ok("静态初始化器里用 @\"...\"",
               'XNRSigVoidNoArg,  NO  },\n    { "endRefreshing"',
@@ -93,8 +109,25 @@ def _selftest():
     mutant_ok("C 字符串字面量里写中文",
               'static const char *kTargetBundlePrefix = "com.xingin.";',
               'static const char *kTargetBundlePrefix = "com.xingin.测试";')
+    # 漏写 @：把 C 字符串当对象传给选择器/函数（ARC 下是硬编译错误）
+    #   ★ 变异体的内容**必须是纯 ASCII**，否则会同时触发规则 13，测的就不是规则 14 了
+    mutant_ok("C 字符串当对象用（漏写 @）",
+              '[NSString stringWithFormat:@"XhsNoRefresh v%s  ✅ 已复制到剪贴板", kVersion]',
+              '[NSString stringWithFormat:"XhsNoRefresh v%s ok", kVersion]')
     # 这一条是故意造括号不平衡，不做平衡校验
     cases.append(("括号不平衡", base + "\nstatic void broken(void) {\n"))
+
+    # ── 以下是「不许误报」的用例：必须 exit 0 ─────────────────────────────
+    # 规则 6 的终止符：同一行闭合的 static 数组，后面隔着几十行代码里还有 @"..."
+    mutant_clean("同行闭合的 static 数组（不该报）",
+                 "static BOOL gInstalled = NO;",
+                 'static BOOL gInstalled = NO;\nstatic const char *zt[] = { "a", "b" };')
+    # 规则 14 的两条豁免：白名单里的 C 字符串函数 + 三元运算符的冒号
+    mutant_clean("strcmp/三元冒号（不该报）",
+                 "    if (gLaunchNo <= 0) return;",
+                 "    if (gLaunchNo <= 0) return;\n"
+                 '    const char *zn = (strcmp(name, "?") == 0) ? "a" : "b";\n'
+                 "    (void)zn;")
 
     ok = True
     tmpdir = tempfile.mkdtemp(prefix="xhscheck_")
@@ -116,6 +149,18 @@ def _selftest():
         ok = ok and caught
         msg = r.stdout.decode("utf-8", "replace").strip().split("\n")[0] if caught else ""
         print("  %s %s%s" % ("✓" if caught else "✗ 没抓到！", label,
+                             ("  → " + msg) if msg else ""))
+
+    # ★ 反面用例：这些必须【通过】，报错就说明规则写得太激进
+    for label, text in clean_cases:
+        fp = os.path.join(tmpdir, "clean.x")
+        open(fp, "w", encoding="utf-8", newline="\n").write(text)
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), fp],
+                           capture_output=True)
+        clean = (r.returncode == 0)
+        ok = ok and clean
+        msg = "" if clean else r.stdout.decode("utf-8", "replace").strip().split("\n")[0]
+        print("  %s %s%s" % ("✓" if clean else "✗ 误报了！", label,
                              ("  → " + msg) if msg else ""))
 
     if missing:
@@ -231,8 +276,23 @@ for fn in ["XNRHookedReloadData", "XNRHookedEndRefreshing", "XNRHookedSetState"]
 # 6a 文件作用域的结构体/数组初始化块
 #     ★ 必须锚定「顶格的 static」：函数体内缩进的 static 不是文件级初始化，
 #       而且它的 "};" 常在同一行，不锚定就会让 .*? 一路吞到后面别的代码里 → 误报
-for m in re.finditer(r"^static\s+[^;\n=]*=\s*\{.*?\n\};", code, re.M | re.S):
-    if '@"' in m.group(0):
+#     ★★ v1.0.5 修掉终止符：原来写 `.*?\n};`，遇到
+#        `static const char *zt[] = { "a", "b" };`（**同一行闭合**）时，
+#        `\n};` 在这个块里根本不存在 → `.*?` 继续往后吞几百行，直到撞上别的函数的 `\n};`，
+#        于是把中间所有 @"..." 都算成"这个初始化块里的" → 假阳性。
+#        （又是那条通则：**新规则一跑就报假阳性，先怀疑规则写错了。**）
+#        现在改成**花括号配对**取块，与写法无关。
+for m in re.finditer(r"^static\s+[^;\n=]*=\s*\{", code, re.M):
+    _d, _k = 0, m.end() - 1
+    while _k < len(code):
+        if code[_k] == "{":
+            _d += 1
+        elif code[_k] == "}":
+            _d -= 1
+            if _d == 0:
+                break
+        _k += 1
+    if '@"' in code[m.start():_k + 1]:
         add("第 %d 行起的静态初始化块里出现 @\"...\"：静态初始化只允许 C 字符串" % line_of(m.start()))
 # 6b 单行静态变量
 for m in re.finditer(r"^static\s+([A-Za-z_][\w\s\*]*?)\s+(\w+)\s*=\s*@\"", code, re.M):
@@ -547,6 +607,111 @@ for _st, _en, _lit in _lits:
             % (s[:_st].count("\n") + 1, _lit[:20]))
     _prev_end, _prev_objc = _en, _objc
 
+# ── 14. C 字符串字面量被当成对象用（漏写 @） ────────────────────────────────
+# 起因（★ 一次"绿灯其实是漏网"的自查）：
+#   v1.0.5 给弹窗加「一键复制」时，顺手写了个变异体 `[NSString stringWithFormat:"…"]`
+#   去验证检查器看得见新代码 —— 结果**检查器放它过去了**。
+#   而这在 ARC 下是**硬编译错误**：
+#     error: implicit conversion of 'char *' to 'NSString *' is disallowed with ARC
+#   （规则 13 只管"中文 C 字符串会花屏"，用的是纯 ASCII 的变异体，所以它不响。）
+#
+# 判据：C 字符串字面量（不带 @）紧跟在
+#   · **选择器的冒号**后面（`actionWithTitle:"…"`）
+#   · **函数名 + `(`** 后面（`XNRLogLine("…")`）
+# 时 → 该位置要的是对象，判为漏写 @。
+#
+#   ★ 只查「第一个参数」的位置，第 2 个参数往后**故意不查**：
+#     `[NSString stringWithFormat:@"%s", "abc"]` 这种把 C 字符串喂给 %s 的写法
+#     是合法且常用的（本工程就靠它输出类名/SEL），查了必然误报。
+#   ★ 白名单里的 API 本来就吃 const char *（SEL / 类名 / str* 家族），必须放行，
+#     否则等于逼着人把正确代码改错（规则 13 第一版就是这么翻车的）。
+_ALLOW_CHARSTAR_FN = {
+    "strcmp", "strncmp", "strcasecmp", "strncasecmp", "strcpy", "strncpy",
+    "strcat", "strlen", "memcmp", "memcpy", "memset", "printf", "fprintf",
+    "sprintf", "snprintf", "puts", "syslog", "fopen", "open", "access",
+    "objc_getClass", "objc_lookUpClass", "objc_getMetaClass", "objc_getRequiredClass",
+    "sel_registerName",
+}
+_ALLOW_CHARSTAR_SFX = ("UTF8String", "CString")   # stringWithUTF8String: / getCString:
+
+
+def _is_ternary_colon(text, colon_idx):
+    """这个冒号是不是三元运算符 `? :` 的那一个（而不是选择器名后面的那一个）。
+
+    ★ 为什么必须分开：规则 14 上线后第一跑就报了一个假阳性 ——
+        `gLaunchNo, name ? name : "?", at`
+      这里的 `"?"` 前面确实是个冒号，但那是**三元运算符**的冒号，不是选择器的。
+      照那个报错去改代码，反而会把本来正确的写法改坏。
+      （**一条新规则一跑就报假阳性 → 先怀疑规则写错了**，这是本项目第 N 次印证。）
+
+    判据：从冒号往回扫，做括号配对；若在同一层遇到 `?` → 它就是三元的。
+    """
+    depth = 0
+    i = colon_idx - 1
+    while i >= 0:
+        ch = text[i]
+        if ch in ")]}":
+            depth += 1
+        elif ch in "([{":
+            if depth == 0:
+                return False          # 到了这一层的开头还没见到 ? → 不是三元
+            depth -= 1
+        elif ch == "?" and depth == 0:
+            return True
+        elif ch == ";" and depth == 0:
+            return False
+        i -= 1
+    return False
+
+
+def _cstr_takes_object(text, st):
+    """判断起点为 st 的 C 字符串字面量是否落在"需要对象"的位置上。
+       返回 (是否可疑, 用于报错的名字)。"""
+    i = st - 1
+    while i >= 0 and text[i] in " \t\n\r":
+        i -= 1
+    if i < 0 or text[i] not in ":(":
+        return (False, "")
+    if text[i] == ":" and _is_ternary_colon(text, i):
+        return (False, "")            # `cond ? a : "b"` —— 这是三元，不是选择器
+    j = i - 1
+    while j >= 0 and text[j] in " \t\n\r":
+        j -= 1
+    k = j
+    while k >= 0 and (text[k].isalnum() or text[k] == "_"):
+        k -= 1
+    name = text[k + 1:j + 1]
+    if not name or any(name.endswith(sfx) for sfx in _ALLOW_CHARSTAR_SFX):
+        return (False, name)
+    if text[i] == ":":
+        return (True, name + ":")
+    if name in _ALLOW_CHARSTAR_FN:
+        return (False, name)
+    if name.isupper() or name.startswith("XNR_"):
+        return (False, name)          # 全大写/带工程前缀的宏 —— 判不准，宁可漏报
+    return (True, name + "(")
+
+
+_prev_end2, _prev_objc2 = -1, False
+for _st, _en, _lit in _lits:
+    _k = _st - 1
+    while _k >= 0 and s[_k] in " \t\n\r":
+        _k -= 1
+    if _k >= 0 and s[_k] == "@":
+        _objc2 = True
+    elif _k + 1 == _prev_end2:
+        _objc2 = _prev_objc2
+    else:
+        _objc2 = False
+    if not _objc2:
+        _bad, _nm = _cstr_takes_object(s, _st)
+        if _bad:
+            add("第 %d 行：`%s` 的位置传了 C 字符串字面量（漏写 @）—— "
+                "ARC 下这是硬编译错误（implicit conversion of 'char *' to 'NSString *'）。"
+                "改成 @\"...\"；若该 API 本来就要 C 字符串，把它加进 _ALLOW_CHARSTAR_* 白名单"
+                % (s[:_st].count("\n") + 1, _nm))
+    _prev_end2, _prev_objc2 = _en, _objc2
+
 if problems:
     for p in problems:
         print("::error file=%s::%s" % (path, p))
@@ -555,4 +720,4 @@ if problems:
 
 print("静态自检通过 ✓  常量齐全 / 零 Logos·substrate / 零几何写入 / 无非法语义调用 / "
       "探针原样放行 / 无静态初始化 @\" / 括号平衡 / 函数唯一 / 先定义后调用 / LF 无 BOM / "
-      "占位符数相符 / 加锁配 @finally / C 字符串无非 ASCII")
+      "占位符数相符 / 加锁配 @finally / C 字符串无非 ASCII / C 字符串没被当对象用")

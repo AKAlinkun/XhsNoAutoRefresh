@@ -49,6 +49,22 @@
 //        另把只读几何观测加密（0.15s × 20s），并在"列表被程序性拉下"的那一刻
 //        顺带记下【这个 scrollView 有没有 refreshControl、顶上几个子视图是什么类】——
 //        那几乎就是直接看到"那个圈圈是谁家的"。
+//
+// v1.0.5 是【一键复制版】—— 用户装完 v1.0.4 后提了一个很实际的要求：
+//        「你在弹窗里加上一个一键复制，省得我截图了」。
+//        截图有三个硬伤：要传好几张、看不清、而且**我看不到原始文本只能靠猜**。
+//        所以本版把弹窗整段文本做成一键进剪贴板。
+//        顺手修掉一个**由 v1.0.4 那三张真机截图逼出来的标签歧义**（这一条更重要）：
+//          真机出现「闸门安装于 2.34 秒 / 首轮扫描于 0.73 秒 / 扫描轮次 1 轮」——
+//          三个数自相矛盾：只扫了 1 轮、第 1 轮就挂上了，为什么两个时刻差 1.6 秒？
+//          答案：这两个数量的**根本不是同一个时刻** ——
+//            「首轮扫描于」取的是进扫描函数【之前】的时钟（= 开始）
+//            「闸门安装于」取的是出扫描函数【之后】的时钟（= 结束）
+//          差额 = 这一轮扫描**自己花掉的时间** = 1.61 秒。
+//          ★ 这个数是主队列上的 1.61 秒 —— 实打实占住了主线程，
+//            正是我们一直在抱怨的那件事（v1.0.2 的「4.2 秒」多半也是同一成因）。
+//          本版**先把口径说清楚并单独显示耗时**，机制不动（一次只动一个变量）；
+//          真要修（把一轮扫不完的活拆到多个 runloop 周期）留给下一版。
 // ---------------------------------------------------------------------------
 
 #import <Foundation/Foundation.h>
@@ -78,7 +94,7 @@ static double kCooldownSecs      = 30.0;
 // ★ v1.0.2：包名不再作为「装不装」的硬开关（见 XNRInstallWhenReady 注释）。
 //   这里只用于日志和弹窗展示，方便一眼核对是不是目标 App。
 static const char *kTargetBundlePrefix = "com.xingin.";
-static const char *kVersion            = "1.0.4";
+static const char *kVersion            = "1.0.5";
 
 // ★★★ v1.0.4：早期安装默认【关闭】。
 //
@@ -216,9 +232,33 @@ static NSString *gRealBundleID = nil;   // ★ 本进程真实包名 —— 排�
 //    要回答的问题：「最后一次成功扫描发生在启动后几秒」「一共扫了几轮」「每轮各挂到几处」
 static volatile int   gInstalling   = 0;   // 简易自旋锁：同一时刻只允许一个安装者在跑
 static int            gTryCount     = 0;   // 扫描轮次
-static double         gFirstTryOffset = -1;// 第一轮扫描发生的时刻（★ 这一个数就能说明"排得早≠跑得早"）
+static double         gFirstTryOffset = -1;// 第一轮扫描【开始】的时刻（★ 这一个数就能说明"排得早≠跑得早"）
 static double         gLastTryOffset  = -1;// 最后一轮扫描的时刻
+static double         gFirstScanCost  = -1;// ★ v1.0.5：首轮扫描【本身】花了多少秒（见下面那段说明）
 static NSMutableArray *gTimeline    = nil; // 每轮："第N轮 @X.XXs → 命中K"
+
+// ★★ v1.0.5：为什么必须把「首轮扫描耗时」单独测出来 —— 这是一个真机数据逼出来的认识。
+//
+//   真机弹窗（v1.0.4）出现过这样一组数：
+//       闸门安装于   启动后 2.34 秒
+//       首轮扫描于   启动后 0.73 秒
+//       扫描轮次     1 轮   最后一轮 启动后 0.73 秒
+//   三个数放在一起【自相矛盾】：既然只扫了 1 轮、而且第 1 轮就挂上了 36 处，
+//   那"闸门安装于"就该等于"首轮扫描于"才对，怎么会差 1.6 秒？
+//
+//   答案在代码里：这两个数**量的根本不是同一个时刻** ——
+//       gFirstTryOffset = 进 XNRInstallGates()【之前】取的时钟（= 扫描开始）
+//       gInstallOffset  = 出 XNRInstallGates()【之后】在函数末尾取的时钟（= 扫描结束）
+//   所以那个差额 = **这一轮扫描自己花掉的时间** = 1.61 秒。
+//
+//   ★ 这个认识很重要，因为它是【主队列】上的 1.61 秒：
+//     默认路径（kEarlyInstall = NO）下，首轮扫描就跑在主队列上，
+//     于是这 1.61 秒是**实打实占住主线程**的 —— 恰恰就是我们一直在抱怨的那件事
+//     （v1.0.2 的「闸门安装于 4.2 秒」多半也是同一个成因：不是"排得晚"，是"扫得慢"）。
+//     佐证：弹窗里 `reloadData 首次 2.4s`，正好落在我们扫完（2.34s）之后。
+//
+//   ★ 本次只【测量并显示】，不改机制 —— 一次只动一个变量。
+//     真要修，方向是"把一轮扫不完的活拆到多个 runloop 周期里"，那是下一版的事。
 
 // ★★ v1.0.3：UIRefreshControl 低频轮询（只读观测）
 //    要回答的问题：「那个圈圈到底是不是 UIRefreshControl 在转」
@@ -1038,11 +1078,16 @@ static BOOL XNRCanPresent(void) {
     } @catch (NSException *e) { (void)e; return NO; }
 }
 
-// ★ v1.0.4：多了一个可选的"额外按钮 + 回调"，用来在弹窗上直接切换「早期安装」开关。
+// ★ v1.0.4：多了可选的"额外按钮 + 回调"，用来在弹窗上直接切换「早期安装」开关。
 //   为什么要做成按钮：真机闪退后用户没法改代码重编译，而**必须能自己把那个开关关掉**。
-//   （extraTitle 传 nil 就是老行为。）
-static BOOL XNRAlert(NSString *title, NSString *msg, NSString *btn,
-                     NSString *extraTitle, void (^extraBlock)(void)) {
+// ★ v1.0.5：从"一个额外按钮"改成**传一组 UIAlertAction**，因为又加了「一键复制」。
+//   为什么传 UIAlertAction 而不是"标题数组 + block 数组"：
+//     后者要把 block 存进 NSArray 再取出来强转回 block 类型，本机没有 clang，
+//     强转写错就是一轮 CI 失败（要用户重新上传/下载/注入）。UIAlertAction 是普通对象，
+//     类型安全、不用任何强转，调用侧直接写 block 字面量即可。
+//   顺序：先 extraActions 里的，最后才是 okTitle（iOS 会把它们竖排）。
+static BOOL XNRAlert(NSString *title, NSString *msg, NSString *okTitle,
+                     NSArray<UIAlertAction *> *extraActions) {
     if (!kShowAlert) return NO;
     if (![NSThread isMainThread]) return NO;
     if (!XNRCanPresent()) return NO;
@@ -1050,19 +1095,18 @@ static BOOL XNRAlert(NSString *title, NSString *msg, NSString *btn,
         UIAlertController *a = [UIAlertController alertControllerWithTitle:title
                                                                   message:msg
                                                            preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:btn style:UIAlertActionStyleDefault handler:nil]];
-        if (extraTitle.length) {
-            [a addAction:[UIAlertAction actionWithTitle:extraTitle
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(UIAlertAction *act) {
-                (void)act;
-                if (extraBlock) extraBlock();
-            }]];
+        for (UIAlertAction *act in extraActions) {
+            if ([act isKindOfClass:[UIAlertAction class]]) [a addAction:act];
         }
+        [a addAction:[UIAlertAction actionWithTitle:okTitle style:UIAlertActionStyleDefault handler:nil]];
         [XNRRootVC() presentViewController:a animated:YES completion:nil];
         return YES;
     } @catch (NSException *e) { (void)e; return NO; }
 }
+
+// ★ v1.0.5：点过「复制」之后，下一次弹窗要在标题上写明"已复制" —— 否则用户不知道到底成没成。
+//   取走即清零（见 XNRPresentStats 开头）：所以这个标记只影响"紧接着的那一次"弹窗。
+static BOOL gStatsJustCopied = NO;
 
 // 把「距启动多少秒」格式化成好看的一小段；没发生过就写明
 static NSString *XNRFmtOff(double t) {
@@ -1076,6 +1120,10 @@ static BOOL XNRPresentStats(void) {
     if (gStartTime <= 0) return NO;
     if (XNRNow() - gStartTime < 10.0) return NO;     // 启动 10 秒内不打扰
     if (!XNRCanPresent()) return NO;                 // 不在稳定态 → 稍后重试
+
+    // ★ v1.0.5：取走「刚复制过」的标记（取走即清零，所以它只影响紧接着的这一次弹窗）
+    BOOL justCopied = gStatsJustCopied;
+    gStatsJustCopied = NO;
 
     @try {
         // ★ v1.0.3：这里的快照必须在锁里取 —— 后台安装线程可能正在往 gHookedNames 追加，
@@ -1119,8 +1167,18 @@ static BOOL XNRPresentStats(void) {
             : @"(还没有)";
 
         // ★ v1.0.3：安装时间线 + 轮询观测
+        // ★★ v1.0.5 修掉一处口径歧义（由真机数据逼出来的，见文件头 v1.0.5 那段）：
+        //   「闸门安装于」= 扫描【结束】的时刻，「首轮扫描于」= 扫描【开始】的时刻，
+        //   两者之差 = 扫描自身耗时。原来标签里没写清，读起来像是自相矛盾。
+        //   现在：前者保持原样，后者改成「开始 X / 耗时 Y」，并把耗时单独摆出来。
         NSString *instStr  = (gInstallOffset < 0) ? @"(还没装上)" : [NSString stringWithFormat:@"启动后 %.2f 秒", gInstallOffset];
-        NSString *firstTry = (gFirstTryOffset < 0) ? @"(还没扫过)" : [NSString stringWithFormat:@"启动后 %.2f 秒", gFirstTryOffset];
+        NSString *firstTry = (gFirstTryOffset < 0)
+            ? @"(还没扫过)"
+            : ((gFirstScanCost >= 0)
+               ? [NSString stringWithFormat:@"开始 %.2fs，本轮耗时 %.2fs%@",
+                  gFirstTryOffset, gFirstScanCost,
+                  (gFirstScanCost > 0.5) ? @"  ⚠️ 这一下是占着主线程的" : @""]
+               : [NSString stringWithFormat:@"开始 %.2fs", gFirstTryOffset]);
         NSString *lastTry  = (gLastTryOffset < 0) ? @"(还没扫过)" : [NSString stringWithFormat:@"启动后 %.2f 秒", gLastTryOffset];
         // ★ 同上：时间线也要在锁里取快照（后台安装线程可能正在追加）
         NSString *timeline = nil;
@@ -1152,7 +1210,7 @@ static BOOL XNRPresentStats(void) {
              "★ 本次为启动#%d   早期安装：%@\n\n"
              "本进程包名\n%@\n\n"
              "闸门安装于         %@\n"
-             "首轮扫描于         %@\n"
+             "首轮扫描           %@\n"
              "扫描轮次           %d 轮   最后一轮 %@\n"
              "各挂钩命中          %@\n"
              "挂钩落脚点         %d 处（其中 beginRefreshing 覆盖 %d 个类）\n"
@@ -1210,13 +1268,45 @@ static BOOL XNRPresentStats(void) {
         // ★ v1.0.4：弹窗上直接给一个开关（下次启动生效），这样即使闪退也不需要改代码
         NSString *toggle = kEarlyInstall ? @"关闭早期安装（下次启动生效，更安全）"
                                          : @"开启早期安装（下次启动生效，有闪退风险）";
-        BOOL ok = XNRAlert([NSString stringWithFormat:@"XhsNoRefresh v%s 统计", kVersion],
-                           msg, @"好", toggle, ^{
+
+        // ★★ v1.0.5：「一键复制」—— 用户原话「省得我截图了」。
+        //   截图有三个硬伤：要传好几张、缩略图看不清、而且我只能靠"看"去猜字符。
+        //   复制的是【整段 msg】（就是弹窗里那些文字，一个字不少），不是屏幕上被截断的可见部分。
+        //   复制完**【再弹一次同一张窗】**、标题上写「✅ 已复制到剪贴板」——
+        //   否则用户不知道到底成没成（静默失败的按钮比没有按钮更糟）。
+        NSMutableArray<UIAlertAction *> *extra = [NSMutableArray array];
+
+        [extra addObject:[UIAlertAction actionWithTitle:@"📋 复制全部（粘给我即可）"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *act) {
+            (void)act;
+            @try { [[UIPasteboard generalPasteboard] setString:msg]; }
+            @catch (NSException *e) { XNRLogLine(@"⚠️ 写剪贴板失败：%@", e); }
+            gStatsJustCopied = YES;
+            XNRLogLine(@"=== 用户点了「复制全部」：%lu 个字已进剪贴板（v%s）",
+                       (unsigned long)msg.length, kVersion);
+            // UIAlertController 点任何 action 都会先 dismiss，而 XNRCanPresent 会挡住
+            // "正在 dismiss" 的状态 → 所以延后一点、并用 XNRStatsRetry 自带的重试兜住动画。
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                @autoreleasepool { XNRStatsRetry(0); }
+            });
+        }]];
+
+        [extra addObject:[UIAlertAction actionWithTitle:toggle
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *act) {
+            (void)act;
             BOOL want = !kEarlyInstall;
             [[NSUserDefaults standardUserDefaults] setBool:want forKey:kEarlyInstallKey];
             [[NSUserDefaults standardUserDefaults] synchronize];
             XNRLogLine(@"=== 用户切换早期安装 → %@（下次启动生效）", want ? @"开" : @"关");
-        });
+        }]];
+
+        NSString *alertTitle = justCopied
+            ? [NSString stringWithFormat:@"XhsNoRefresh v%s  ✅ 已复制到剪贴板", kVersion]
+            : [NSString stringWithFormat:@"XhsNoRefresh v%s 统计", kVersion];
+        BOOL ok = XNRAlert(alertTitle, msg, @"好", extra);
         if (ok) {
             XNRMarkPhase(XNR_PHASE_STATS_SHOWN);
             XNRLogLine(@"--- 前台统计：包名=%@ 装于%.2fs 首扫%.2fs 轮次=%d 钩=%d 见=%d(主%d/后%d) 放行=%d 吃掉=%d",
@@ -1277,7 +1367,22 @@ static int XNRInstallAttempt(void) {
     @try {
         double off = (gStartTime > 0) ? (XNRNow() - gStartTime) : 0.0;
         gInstallTries = gTryCount + 1;
+        // ★★ v1.0.5：把「这一轮扫描自己花了多久」量出来。
+        //   起因是一个自相矛盾的真机数据：扫描轮次=1、第1轮就挂上了 36 处，
+        //   但「闸门安装于 2.34s」和「首轮扫描于 0.73s」差了 1.6 秒。
+        //   答案就是这两个数取时钟的位置不同（前=扫描开始，后=扫描结束），
+        //   差额 = 扫描自身的耗时。而这个耗时是【主队列】上的 1.6 秒 ——
+        //   实打实占住主线程，正是我们一直在抱怨的那件事，必须让它显形。
+        double t0 = XNRNow();
         n = XNRInstallGates();
+        double t1 = XNRNow();
+        if (gFirstScanCost < 0) {
+            gFirstScanCost = t1 - t0;
+            if (gFirstScanCost > 0.5) {
+                XNRLogLine(@"⚠️ 首轮扫描自己就花了 %.2f 秒（且跑在主队列上 → 这一段主线程是被我们占住的）",
+                           gFirstScanCost);
+            }
+        }
         gTryCount++;
         if (gFirstTryOffset < 0) gFirstTryOffset = off;
         gLastTryOffset = off;
