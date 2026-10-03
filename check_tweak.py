@@ -45,9 +45,14 @@ def _selftest():
             return
         cases.append((label, base.replace(old, new, 1)))
 
-    # ★ 变异体必须是【语法上依然平衡】的，否则测的是"另一个问题"，
+    # ★ v1.0.8：变异体必须是【语法上依然平衡】的，否则测的是"另一个问题"，
     #   结论也解释不通（本轮就踩过：变异体多出一个花括号，反而让规则 5 漏报）。
-    def mutant_ok(label, old, new):
+    #   ★★ 而 v1.0.8 又发现了这层校验的**另一半漏洞**：
+    #     一个变异体可能**被别的规则顺手兜住** —— 于是 exit code 是 1、"✓ 抓到了"，
+    #     但被测的那条规则其实一次都没响。测试绿了，规则却是坏的。
+    #   → 所以 mutant_ok 增加 `expect`：**必须由这条规则抓**（在输出里出现指定的那句话）。
+    #     这是本项目反复学到的那条纪律的一个新侧面：**"报错了"不等于"报的是我要查的那件事"。**
+    def mutant_ok(label, old, new, expect=None):
         if old not in base:
             # ★★ v1.0.4：锚点找不到**不能只是"跳过"** —— 那等于这条检查从此悄悄失效，
             #   而我们恰恰是因为"检查器静默失效"栽过三次。所以这里直接判为失败，
@@ -61,7 +66,7 @@ def _selftest():
                 print("  ！变异体本身括号不平衡，测试无效：%s" % label)
                 missing.append(label)
                 return
-        cases.append((label, t))
+        cases.append((label, t, expect))
 
     # ★★ v1.0.5：反向测试原来只测"该报的报了没有"，**测不出"不该报的乱报了"**。
     #   而本项目栽在假阳性上的次数并不比漏报少：
@@ -80,16 +85,24 @@ def _selftest():
 
     mutant_ok("静态初始化器里用 @\"...\"",
               'XNRSigVoidNoArg,  NO  },\n    { "endRefreshing"',
-              'XNRSigVoidNoArg,  NO, @"拦截+计数" },\n    { "endRefreshing"')
+              'XNRSigVoidNoArg,  NO, @"拦截+计数" },\n    { "endRefreshing"', expect="静态初始化块里出现")
     mutant_ok("实参个数不符",
-              "XNRFmtOff(gProbeEndFirst)", "XNRFmtOff(gProbeEndFirst, 1)")
+              "XNRFmtOff(gProbeEndFirst)", "XNRFmtOff(gProbeEndFirst, 1)", expect="个实参，但定义是")
     mutant_ok("常量定义被删",
-              "static const NSInteger kStatePulling = 2;", "")
+              "static const NSInteger kStatePulling = 2;", "", expect="但没有定义")
     mutant_ok("出现几何写入",
               "static BOOL kProbeTrigger = YES;",
-              "static BOOL kProbeTrigger = YES;\nstatic void badGeom(id v){ [v setContentOffset:CGPointZero]; }")
+              "static BOOL kProbeTrigger = YES;\nstatic void badGeom(id v){ [v setContentOffset:CGPointZero]; }", expect="几何写入")
     mutant_ok("出现 Logos 钩子",
-              "#pragma mark - 配置", "%hook Foo\n%end\n\n#pragma mark - 配置")
+              "#pragma mark - 配置", "%hook Foo\n%end\n\n#pragma mark - 配置", expect="Logos 钩子")
+    # ★ v1.0.8 机制禁令：把取类表换回 objc_copyClassList（= 退回 1347 ms 的病根）
+    #   ★ 这条的特别之处：它是**覆盖率探针先指出"这是盲区"、然后才被堵上**的第一条。
+    #     （探针里那条 `[盲区] 把 objc_getClassList 换回 objc_copyClassList` 现在应当被报到。）
+    #   ★ 它**测的是"真代码"**（锚点是 XNRCopyClassList 的调用点），不是"造一段假源码"。
+    mutant_ok("把取类表换回 objc_copyClassList（退回病根）",
+              "XNRCopyClassList(&gWalkCount);",
+              "objc_copyClassList(&gWalkCount);",
+              expect="objc_copyClassList")
     # 探针不再转交原实现：把 reloadData 探针里的两行转交代码整段删掉（花括号保持平衡）
     mutant_ok("探针不再转交原实现",
               "    IMP orig = XNROrigFor(self, _cmd);\n"
@@ -97,41 +110,57 @@ def _selftest():
               "}\n\n"
               "// ② 刷新结束",
               "}\n\n"
-              "// ② 刷新结束")
+              "// ② 刷新结束", expect="没有把调用转交原实现")
     # 格式化占位符与实参不符：从那个 37 占位符的弹窗模板里删掉一个实参
     mutant_ok("格式化占位符与实参不符",
-              "            gProbeReload, XNRFmtOff(gProbeReloadFirst),\n", "")
+              "            gProbeReload, XNRFmtOff(gProbeReloadFirst),\n", "", expect="个占位符，但传了")
     # 加锁后提前 return 漏解锁：把 @finally 拆成普通语句
     mutant_ok("加锁后提前 return 漏解锁",
-              "@finally { [lk unlock]; }", "[lk unlock];")
+              "@finally { [lk unlock]; }", "[lk unlock];", expect="没有 @finally")
     # C 字符串里写中文 → 经 %s 输出会花屏（真机上才看得见的 bug）
     #   ★ 锚点特意选 kTargetBundlePrefix：它的值不随版本号变化，不会因为"改版本号"而失效
     mutant_ok("C 字符串字面量里写中文",
               'static const char *kTargetBundlePrefix = "com.xingin.";',
-              'static const char *kTargetBundlePrefix = "com.xingin.测试";')
+              'static const char *kTargetBundlePrefix = "com.xingin.测试";', expect="非 ASCII")
     # 漏写 @：把 C 字符串当对象传给选择器/函数（ARC 下是硬编译错误）
     #   ★ 变异体的内容**必须是纯 ASCII**，否则会同时触发规则 13，测的就不是规则 14 了
     mutant_ok("C 字符串当对象用（漏写 @）",
               '[NSString stringWithFormat:@"XhsNoRefresh v%s  ✅ 已复制到剪贴板", kVersion]',
-              '[NSString stringWithFormat:"XhsNoRefresh v%s ok", kVersion]')
+              '[NSString stringWithFormat:"XhsNoRefresh v%s ok", kVersion]', expect="传了 C 字符串字面量")
     # ★ v1.0.6：占位符【类型】位置（规则 11c）。
     #   「个数对、类型不对」也是崩溃级，而 v1.0.6 一次加了 4 个新的 %@，正是高发场景。
     #   这两个变异体都保持实参个数不变，所以只会命中 11c、不会命中 11 —— 测的就是新规则本身。
     mutant_ok("占位符类型不符（%@ 吃到 int 实参）",
               "            gProbeReload, XNRFmtOff(gProbeReloadFirst),",
-              "            gProbeReload, gProbeReload,")
+              "            gProbeReload, gProbeReload,", expect="是数值/标量")
     mutant_ok("占位符类型不符（%d 吃到对象实参）",
               "            gProbeReload, XNRFmtOff(gProbeReloadFirst),",
-              "            kVersion, XNRFmtOff(gProbeReloadFirst),")
+              "            kVersion, XNRFmtOff(gProbeReloadFirst),", expect="会把指针当整数解释")
     # ★ v1.0.7：规则 8 的「关键函数清单」是一条**会腐烂的清单** ——
     #   本轮把 XNRInstallGates 拆成四个函数时就踩到了：清单没同步 →
     #   规则 8 立刻以"真定义出现 0 次"报警（这正是它该做的，但说明清单必须跟着改）。
     #   这个用例保证它的**计数**仍然有效（造一处重复真定义）。
     mutant_ok("关键函数出现两处真定义",
               "static void XNRRefreshGateInfo(void) {",
-              "static void XNRRefreshGateInfo(void) {\n}\nstatic void XNRRefreshGateInfo(void) {")
+              "static void XNRRefreshGateInfo(void) {\n}\nstatic void XNRRefreshGateInfo(void) {", expect="真定义出现 2 次")
     # 这一条是故意造括号不平衡，不做平衡校验
     cases.append(("括号不平衡", base + "\nstatic void broken(void) {\n"))
+    # ★ v1.0.8：规则 16 —— 「字符串被半角引号截断」。
+    #   ★★ 变异体**照着真实 bug 的形态来**（这才是关键）：真实那一行有 **4** 个引号（偶数），
+    #      所以"数引号个数"那种写法根本抓不到它；抓到它的是"中文跑到了代码区"这条子判据。
+    #      变异体故意不做成"引号根本未闭合"—— 那会连锁污染其它规则（见规则 16 上面的实测），
+    #      虽然也会报错，但测的就不是"这条规则能不能抓到真 bug"了。
+    #   ★★ 而这条规则本身，就是**新写的代码自己踩出来的**（见规则 16 上面的说明）——
+    #      这正是「新写法要当场造变异体」的另一半价值：它能长出**新规则**。
+    mutant_ok("字符串被半角引号截断（中文漏到代码区）",
+              '@"=== v%s 窄快扫：取类表 %.0f ms（%d 个类）/ 遍历 %.0f ms / "',
+              '@"=== v%s 窄快扫：取类表 %.0f ms（%d 个类）/ "遍历" %.0f ms / "',
+              expect="代码区**里出现了中文字符")
+    #   再补一个"引号根本没闭合"的形态，专门验证子判据 (a)
+    mutant_ok("字符串没有闭合（引号成奇数）",
+              "static BOOL gInstalled = NO;",
+              'static BOOL gInstalled = NO;\nstatic const char *zq = "abc;',
+              expect="双引号没有配对")
 
     # ── 以下是「不许误报」的用例：必须 exit 0 ─────────────────────────────
     # 规则 6 的终止符：同一行闭合的 static 数组，后面隔着几十行代码里还有 @"..."
@@ -151,6 +180,22 @@ def _selftest():
                  "    if (gLaunchNo <= 0) return;\n"
                  '    NSString *zz = [NSString stringWithFormat:@"%@ %.1f", (id)nil, pool[0]];\n'
                  "    (void)zz;")
+    # ★ v1.0.8：规则 16 的两条豁免 —— 它们是这条规则一开始就必须避开的假阳性来源。
+    # ① `//` 注释里可以随便出现引号（本文件注释里就有好几处；若按"整行数引号"必误报）
+    mutant_clean("注释里的引号（不该报）",
+                 "    if (gLaunchNo <= 0) return;",
+                 "    if (gLaunchNo <= 0) return;\n"
+                 "    // 这就是所谓的\"边界\"情况：注释里可以随便写 \" 引号\n")
+    # ② 字符串里的转义引号 `\"` 不结束字符串（漏了这条，正常代码会被判成错）
+    mutant_clean("字符串里的转义引号（不该报）",
+                 "    if (gLaunchNo <= 0) return;",
+                 "    if (gLaunchNo <= 0) return;\n"
+                 '    NSString *ze = @"a\\"b"; (void)ze;\n')
+    # ③ `#pragma mark - <中文>` 是唯一豁免的"代码区带中文"形态（本工程有 16 处）
+    mutant_clean("#pragma mark 里的中文（不该报）",
+                 "    if (gLaunchNo <= 0) return;",
+                 "    if (gLaunchNo <= 0) return;\n"
+                 "#pragma mark - 中文小标题里也可以有 \" 这种引号\n")
 
     ok = True
     tmpdir = tempfile.mkdtemp(prefix="xhscheck_")
@@ -163,16 +208,27 @@ def _selftest():
         print(p0.stdout.decode("utf-8", "replace"))
         return False
 
-    for label, text in cases:
+    for c in cases:
+        label, text = c[0], c[1]
+        expect = c[2] if len(c) > 2 else None
         fp = os.path.join(tmpdir, "case.x")
         open(fp, "w", encoding="utf-8", newline="\n").write(text)
         r = subprocess.run([sys.executable, os.path.abspath(__file__), fp],
                            capture_output=True)
         caught = (r.returncode == 1)
+        out = r.stdout.decode("utf-8", "replace")
+        msg = out.strip().split("\n")[0] if caught else ""
+        # ★ v1.0.8：不只要求"报错了"，还要求"报的是这条规则"
+        if caught and expect and expect not in out:
+            caught = False
+            print("  ✗ %s  —— 报是报了，但**不是这条规则抓的**（期望输出里含 %r）；"
+                  "说明这个变异体被别的规则顺手兜住了，被测的规则其实没响" % (label, expect))
+            print("      实际输出：%s" % msg)
         ok = ok and caught
-        msg = r.stdout.decode("utf-8", "replace").strip().split("\n")[0] if caught else ""
-        print("  %s %s%s" % ("✓" if caught else "✗ 没抓到！", label,
-                             ("  → " + msg) if msg else ""))
+        if caught:
+            print("  ✓ %s%s" % (label, ("  → " + msg) if msg else ""))
+        elif not (expect and expect not in out):
+            print("  ✗ 没抓到！%s" % label)
 
     # ★ 反面用例：这些必须【通过】，报错就说明规则写得太激进
     for label, text in clean_cases:
@@ -192,7 +248,15 @@ def _selftest():
         print("     处理办法：把锚点更新成新代码里的等价片段；若这条规则确实不再需要，就把它删掉。")
         ok = False
 
-    print("\n反向测试：%s" % ("全部通过 ✓ 这个检查器是有效的" if ok else "不可靠 ✗ —— 别拿它当交付依据"))
+    # ★ v1.0.8：把条数**由脚本自己算出来打出来**。
+    #   起因：v1.0.8 加了 2 条必报用例（14 → 16），但 `control` 和 README 里还写着
+    #   「15 必报」—— 数字对不上。★ 凡是"人手工维护的计数"，迟早会腐烂；
+    #   唯一可靠的办法是让它**从数据里长出来**，而不是写在别处。
+    n_must  = len(cases)
+    n_clean = len(clean_cases)
+    print("\n反向测试：%s （必报 %d 条 + 必不报 %d 条，共 %d 条用例）"
+          % ("全部通过 ✓ 这个检查器是有效的" if ok else "不可靠 ✗ —— 别拿它当交付依据",
+             n_must, n_clean, n_must + n_clean))
     return ok
 
 
@@ -260,6 +324,20 @@ for pat, msg in [(r"\]\s*endRefreshing\s*\]", "直接发消息调用 endRefreshi
                  (r"\]\s*reloadData\s*\]", "直接发消息调用 reloadData（禁止）")]:
     if re.search(pat, code):
         add(msg)
+
+# ── 4b. ★ v1.0.8 机制禁令：不许再用 objc_copyClassList ───────────────────────
+#   v1.0.8 的**全部意义**就是「取类表不强制 realize」，靠的是换成 objc_getClassList。
+#   一旦有人把它换回去（比如心想"反正语义一样、两种写法都扫真类"），
+#   v1.0.7 那个 **1347 ms 的病根就原样回来** —— 而它**编得过、跑得通、静态上完全合法**，
+#   没有任何别的检查会响。★ 这正是覆盖率探针里那条「已知盲区」，
+#   现在把它**从盲区里拿出来**，做成一条零风险的禁令。
+#   ★ 判据必须作用在 `code`（已去注释、去字符串）上：
+#     本工程**注释里**提到 objc_copyClassList 有 11 处（都是解释"为什么不用它"），
+#     作用在原文上必误报；实测 `code` 里它是 **0 次** → 这条规则零假阳性风险。
+if re.search(r"\bobjc_copyClassList\b", code):
+    add("出现 objc_copyClassList（v1.0.8 起明令禁止：它内部会先 realizeAllClasses()，"
+        "把镜像里所有还没 realize 的类一口气全 realize 一遍 —— 真机实测在主队列上花了 1347 ms，"
+        "正好遮住我们自己的观测窗口）。取类表请统一用 XNRCopyClassList()")
 
 # ── 5. 只读探针必须把调用「原样转交」给原实现 ──────────────────────────────
 # 防止有人把探针写成"只计数不转交" → 那就是偷偷改行为（等于把 -reloadData 废掉）
@@ -337,9 +415,11 @@ for op, cl in [("{", "}"), ("(", ")"), ("[", "]")]:
 #   XNRScanOneClass（单类处理）/ XNRInstallNarrow（窄快扫）/
 #   XNRInstallChunkStep（分片推进）/ XNRRefreshGateInfo（收尾统计）/ XNRNarrowRescanLoop（重扫循环）。
 #   ⚠️ 拆函数时**必须同步改这里**，否则这条规则会以"真定义出现 0 次"的形式报警（这正是它的作用）。
+# ★ v1.0.8：新增 XNRCopyClassList（取类表，不强制 realize）—— 它是本版唯一的机制改动，
+#   而且必须在 XNRInstallNarrow 之前定义（规则 9"先定义后调用"也会跟着管它）。
 for fn in ["XNRPresentStats", "XNRStatsRetry", "XNRInstallWhenReady",
            "XNRScanOneClass", "XNRInstallNarrow", "XNRInstallChunkStep",
-           "XNRRefreshGateInfo", "XNRNarrowRescanLoop",
+           "XNRRefreshGateInfo", "XNRNarrowRescanLoop", "XNRCopyClassList",
            "XNRFmtOff", "XNRFmtTimes", "XNRProbeNote", "XNRPageOfAny", "XNRIsRefreshControl",
            "XNRRecordEventKind", "XNRAllEvents", "XNRRecordEvent",
            "XNRInstallAttempt", "XNREarlyInstallStep", "XNRPollScan", "XNRPollTick",
@@ -872,6 +952,66 @@ for _st, _en, _lit in _lits:
                 % (s[:_st].count("\n") + 1, _nm))
     _prev_end2, _prev_objc2 = _en, _objc2
 
+# ── 16. 字符串字面量不许被意外截断（两个子判据） ───────────────────────────
+# 起因（v1.0.8，本版新写的代码**自己踩的**）：
+#   新加的一句日志里，中文文案中间夹了一对**半角**双引号：
+#       XNRLogLine(@"=== 窄快扫整块耗时 %.0f ms"
+#                  @"—— 这两半才是"我们挡住主线程"的账", ...);
+#   字符串在第二个 `"` 处提前结束，于是 `我们挡住主线程` 变成了一段**裸代码**。
+#   ★ clang 对这种情况的报错会指向别处（通常是后面某一行的 `%` 或某个变量名），极难反查；
+#     本机没有 iOS clang，只能靠静态检查先兜住。
+#
+# ★★ 一开始我写的是"每行双引号数必须为偶数"——**它抓不到这个 bug**：
+#    那一行有 4 个引号，是偶数（第一对闭合、第二对又重新打开）。
+#    真正的特征是**中文出现在了"代码区"**（既不在字符串里、也不在注释里）。
+#    这是本项目必然会出现的一类错（弹窗那 50 多个占位符的模板全是中文），所以按这个特征查。
+#
+# 子判据：
+#   (a) 逐行双引号必须配对（`\` 转义要跳过、`//` 之后不再看）—— 抓"字符串根本没闭合"。
+#       ★ 这条本身不是重点，但它是"污染源"：一个没闭合的引号会让**后面所有规则一起失灵**
+#         （实测：把 `static const char *zq = "abc"def";` 插到文件开头，规则 7 报括号不平衡、
+#          规则 8 报 23 个函数"真定义出现 0 次" —— 全是同一个未闭合引号的连锁反应）。
+#   (b) 代码区不许出现非 ASCII 字符 —— 抓"字符串被提前截断、中文漏到代码里"。
+#   ★ 豁免：`#pragma mark - <中文>` 这种行（本工程有 16 处）。**只豁免 `#pragma`**，
+#     `#import` / `#define` 这些行照常检查 —— 豁免面越小，这条规则越可信。
+_pragma_ok = ("#pragma",)
+_line_no = 0
+for _ln in s.split("\n"):
+    _line_no += 1
+    if _ln.lstrip().startswith(_pragma_ok):
+        continue
+    _in_str = False
+    _j = 0
+    _hit = None
+    while _j < len(_ln):
+        _ch = _ln[_j]
+        if _in_str:
+            if _ch == "\\":               # 转义：连同下一个字符一起跳过
+                _j += 2
+                continue
+            if _ch == '"':
+                _in_str = False
+            _j += 1
+            continue
+        if _ch == '"':
+            _in_str = True
+        elif _ch == "/" and _j + 1 < len(_ln) and _ln[_j + 1] == "/":
+            break                         # 行注释 → 后面不看了
+        elif ord(_ch) > 127:
+            _hit = _ch
+            break
+        _j += 1
+    if _in_str:
+        add("第 %d 行的双引号没有配对 —— 字符串字面量没有闭合。"
+            "★ 这一处会让**后面所有规则一起失灵**（括号数、函数定义全乱），"
+            "而 clang 的报错会指向别处，所以必须在这里先拦下。"
+            "中文文案里的引号请写成全角「」或 \\\"：%s"
+            % (_line_no, _ln.strip()[:70]))
+    elif _hit is not None:
+        add("第 %d 行的**代码区**里出现了中文字符「%s」—— 说明某个字符串字面量被半角引号"
+            "提前截断了（中文漏到了字符串外面）。中文只能出现在 @\"...\" 里或 // 注释里。"
+            "线索：%s" % (_line_no, _hit, _ln.strip()[:70]))
+
 if problems:
     for p in problems:
         print("::error file=%s::%s" % (path, p))
@@ -880,4 +1020,5 @@ if problems:
 
 print("静态自检通过 ✓  常量齐全 / 零 Logos·substrate / 零几何写入 / 无非法语义调用 / "
       "探针原样放行 / 无静态初始化 @\" / 括号平衡 / 函数唯一 / 先定义后调用 / LF 无 BOM / "
-      "占位符数相符 / 占位符类型相符 / 加锁配 @finally / C 字符串无非 ASCII / C 字符串没被当对象用")
+      "占位符数相符 / 占位符类型相符 / 加锁配 @finally / C 字符串无非 ASCII / "
+      "C 字符串没被当对象用 / 字符串没被意外截断")

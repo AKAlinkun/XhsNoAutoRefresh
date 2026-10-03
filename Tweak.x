@@ -114,6 +114,61 @@
 //        ★ 另加一项只读观测：**切后台（willResignActive）时刻** —— v1.0.6 的数据里
 //          `reloadData 时刻` 末尾有 13.0~13.1 秒的一簇 8 次，无法判断是"用户自己下拉"
 //          还是"切回来时的刷新"，就是因为缺了"用户什么时候离开"这个锚点。
+//
+// v1.0.8 是【取类表不再强制 realize 版】—— 只改**一件事**，而这件事是 v1.0.7 的实测数据指出来的。
+//
+//        用户装完 v1.0.7 后粘回全文，头两行就是决定性的：
+//          拦截挂钩就位   启动后 2.17 秒（窄快扫耗时 1347 ms ⚠️ 还占着主线程）
+//          轮询首次采样   启动后 2.4s
+//
+//        ★ 结论一：**方向对了，但我把"窄快扫"的成本估错了 —— 它跑了 1.347 秒，不是 30 毫秒。**
+//          窄快扫开始于 ≈0.82s，结束于 2.17s。而它的循环是**故意做成最便宜的**：
+//          每个类只做一次 class_getName + 一次 strstr，一次方法查找都没有。
+//          十万级类跑一遍这种循环只要几十毫秒 —— **它不可能是那 1.3 秒的来源。**
+//          → 那 1.3 秒只能来自 `objc_copyClassList()` **自己**。它的实现是：
+//                rwlock_writer_t lock(runtimeLock);  realizeAllClasses();  …
+//            也就是**强制把镜像里所有还没 realize 的类全部 realize 一遍**
+//            （给每个类建 class_rw_t、展开方法表、处理 category）。App 刚起来时绝大多数类都还没 realize，
+//            所以这一下就是"一口气把全 App 的类都点着"，1.3 秒，而且跑在主队列上。
+//
+//        ★ 结论二（这条更能说明问题）：`轮询首次采样 2.4s ≈ 拦截挂钩就位 2.17s + 0.15s（采样间隔）`
+//          —— 轮询和安装块在**同一个主队列**上、而且排在安装块**后面**，
+//          所以它必须等窄快扫跑完。**挡住我们自己观测窗口的，就是我们自己的窄快扫。**
+//          （旁证：分片扫本身工作正常 —— 轮询 68 次覆盖 2.4→12.6s，10.2 秒里一次没漏，
+//            说明"片间让位"是生效的。问题只在窄快扫那一整块。）
+//
+//        所以本版只改这一处：**把取类表的 API 换掉。**
+//          objc_copyClassList()  → 先 realizeAllClasses()，再拷一份【只要真类】的表
+//          objc_getClassList()   → 只读已登记的类表（**不 realize**），但会把 metaclass 一起给出来
+//          于是自己滤掉 metaclass，语义与原来完全一致（只扫真类，不多扫一倍）。
+//        ★ 那 1.3 秒的 realize 活**并没有消失，也不该消失**（全量扫反正要用到每一个类）——
+//          它只是不该由"取类表"这一步在主队列上一口气付掉；换成 objc_getClassList 之后，
+//          这笔钱会被摊进分片全量扫里（每个类被 class_getInstanceMethod 访问时懒 realize），
+//          而每一片都有时间上界。**这正是我们要的形态。**
+//
+//        配套（都不是机制改动）：
+//          A. 窄快扫的耗时**拆成"取类表 + 遍历"两半**并都打进弹窗 ——
+//             下一次数据里「取类表」这一半就是**直接证据**（应从 1347ms 掉到几毫秒）；
+//             如果它没掉，说明我判断错了，那就换方向（把取类表整个搬到后台队列）。
+//          B. 分片从"按个数切"改成**双上界**：最多 XNR_CHUNK_CLASSES 个类 **或** 最多 XNR_CHUNK_MAX_MS 毫秒，
+//             先到者为准。理由：v1.0.7 出现「单片最长 164 ms」，而"单片最长"这个量的语义
+//             本来就是"我们最久一次挡住主线程多久"—— 按个数切根本保证不了它，只有按时间切才能给它硬上界。
+//             同时 400 → 200（按 v1.0.7 README 里已经写明的门槛：>100ms 就调小）。
+//          C. 构造函数里**把轮询排到安装前面**（只调顺序）—— 主队列先进先出，
+//             安装块排在前面就会把轮询的第一次采样整个顶到它后面去，而轮询是唯一不依赖挂钩的观测通道。
+//          D. 再补一条「**真的进了后台**」（didEnterBackground）时刻 ——
+//             因为 willResignActive **也会被"下拉通知中心/控制中心"触发**，那时 App 并没有切走。
+//             v1.0.7 里 `切后台时刻 12.1` 紧跟着 `reloadData 时刻 12.3`，靠这两行的差集才能判断那一簇的成因。
+//          E. 把 `objc_copyClassList` 加进静态自检的**禁令清单** ——
+//             本版的机制就是"换掉它"，可它**编得过、跑得通、静态上完全合法**：
+//             一旦有人心想"反正两种写法都扫真类"把它换回去，1347 ms 的病根就原样搬回来，
+//             而**没有任何别的检查会响**。能零成本堵住的盲区就不该留着当盲区。
+//             判据作用在**去注释后的代码**上（本工程注释里解释"为什么不用它"有 11 处，
+//             作用在原文上必误报；实测去注释后是 0 次）→ 零假阳性风险。
+//
+//        ⚠️ 这一版**仍然没有**"一定能拦住"的承诺：它保证的是"我们不再自己遮住观测窗口"。
+//           如果还是刷，我们要看的是 —— 「取类表」掉下来了吗？`拦截挂钩就位` 到了几点几秒？
+//           `轮询首次采样` 提前了吗？以及那一次刷新到底落在第几秒（这次终于看得见了）。
 // ---------------------------------------------------------------------------
 
 #import <Foundation/Foundation.h>
@@ -143,7 +198,7 @@ static double kCooldownSecs      = 30.0;
 // ★ v1.0.2：包名不再作为「装不装」的硬开关（见 XNRInstallWhenReady 注释）。
 //   这里只用于日志和弹窗展示，方便一眼核对是不是目标 App。
 static const char *kTargetBundlePrefix = "com.xingin.";
-static const char *kVersion            = "1.0.7";
+static const char *kVersion            = "1.0.8";
 
 // ★★★ v1.0.4：早期安装默认【关闭】。
 //
@@ -289,6 +344,17 @@ static int            gTryCount     = 0;   // 扫描轮次
 static double         gFirstTryOffset = -1;// 第一轮扫描【开始】的时刻（★ 这一个数就能说明"排得早≠跑得早"）
 static double         gLastTryOffset  = -1;// 最后一轮扫描的时刻
 static double         gFirstScanCost  = -1;// ★ v1.0.5：首轮扫描【本身】花了多少秒（见下面那段说明）
+// ★★★ v1.0.8：把那"一整块扫描耗时"再拆成两半 —— 这是被 v1.0.7 的真机数据逼出来的。
+//   真机：`拦截挂钩就位 启动后 2.17 秒（窄快扫耗时 1347 ms）`。
+//   窄快扫的循环本身**不可能**要 1.3 秒：它每个类只做一次 class_getName + 一次 strstr，
+//   连方法查找都没有，十万级类也就几十毫秒。
+//   → 那 1.3 秒只能来自 **objc_copyClassList() 自己**：它内部会调 realizeAllClasses()，
+//     把镜像里所有还没 realize 的类全部 realize 一遍（给每个类建 class_rw_t、展开方法表、处理 category）。
+//     这才是真正的开销 —— 而且**任何"枚举全部类"的做法都会付这笔钱**。
+//   所以要把它拆开单独记，下一版的数据才可能是"证明"而不是"猜"。
+static double         gClassListMs    = -1; // 取类表（XNRCopyClassList）自己花了多少秒
+static int            gClassListCount = 0;  // 这一次取到多少个类（过滤掉 metaclass 之后）
+static double         gClassListLoopMs = -1;// 取到之后，遍历这批类花了多少秒
 static NSMutableArray *gTimeline    = nil; // 每轮："第N轮 @X.XXs → 命中K"
 
 // ★★ v1.0.5：为什么必须把「首轮扫描耗时」单独测出来 —— 这是一个真机数据逼出来的认识。
@@ -381,6 +447,12 @@ static int      gFgCount = 0;
 //   "切回来时 App 自己刷的"，完全没法判断。缺的就是"用户什么时候离开"这个锚点。
 static double   gBgAt[8];
 static int      gBgCount = 0;
+// ★ v1.0.8：再补一条「真的进了后台」（didEnterBackground）的时刻。
+//   为什么 willResignActive 不够：它**也会被"下拉通知中心/控制中心"触发**，而那时 App 并没有切走。
+//   v1.0.7 数据里 `切后台时刻 12.1`、紧接着 `reloadData 时刻 12.3` —— 这一簇的成因到底是
+//   "切走"还是"只是拉了一下通知中心"，这两行的差别就是答案。
+static double   gBgEnterAt[8];
+static int      gBgEnterCount = 0;
 static double   gReloadAt[16];              // ③ 每次 -reloadData 的时刻（只留前 16 个）
 static int      gReloadAtCount = 0;
 static double   gMaxInsetTop = -1;          // ④ 见过的最大 adjustedContentInset.top
@@ -1153,6 +1225,66 @@ static void XNRRefreshGateInfo(void) {
 //       RCTTurboListRefreshControl / XYSparkModule.XYSparkRefreshHeader
 //
 //   返回：新挂上的 beginRefreshing 数
+// ★★★ v1.0.8：**取类表不再强制 realize** —— 这是本版唯一的机制改动。
+//
+//   先把 v1.0.7 的真机数据摆出来，因为它把结论钉死了：
+//       拦截挂钩就位   启动后 2.17 秒（窄快扫耗时 1347 ms ⚠️ 还占着主线程）
+//       轮询首次采样   启动后 2.4s
+//   → 窄快扫开始于 ≈ 0.82s，结束于 2.17s。**它花了 1.347 秒。**
+//
+//   而窄快扫的循环是**故意做成最便宜的**：每个类只做一次 class_getName + 一次 strstr，
+//   一次方法查找都没有（命中 Refresh 名字的才进 XNRScanOneClass）。
+//   十万级类跑一遍这种循环只要几十毫秒 —— **它不可能是那 1.3 秒的来源。**
+//
+//   → 那 1.3 秒只能来自 `objc_copyClassList()` **自己**。
+//     它的实现是：`rwlock_writer_t lock(runtimeLock); realizeAllClasses(); …`
+//     也就是**强制把镜像里所有还没 realize 的类全部 realize 一遍**
+//     （给每个类建 class_rw_t、展开方法表、处理 category）。App 刚起来时绝大多数类都还没 realize，
+//     所以这一下就是"一口气把全 App 的类都点着" —— 1.3 秒，而且跑在主队列上。
+//
+//   ★★ 第二个铁证（这条更能说明问题）：
+//       `轮询首次采样 2.4s ≈ 拦截挂钩就位 2.17s + 0.15s（采样间隔）+ 一次 dispatch 跳转`
+//      轮询是和安装块**同一个主队列**、而且排在安装块**后面**的，所以它必须等窄快扫跑完。
+//      **挡住我们自己观测窗口的，就是我们自己的窄快扫。**
+//
+//   ★ 那 1.3 秒的 realize 活**并没有消失，也不该消失**（后面全量扫反正要用到每一个类）——
+//     它只是**不该由"取类表"这一步在主队列上一口气付掉**。换成 objc_getClassList 之后，
+//     这笔钱会被摊进分片全量扫里（每个类被 class_getInstanceMethod 访问时懒 realize），
+//     而分片扫的每一片都有时间上界 —— **这正是我们要的形态。**
+//
+//   两个 API 的差别（这就是本版的全部改动）：
+//     objc_copyClassList()  → 先 realizeAllClasses()，再 malloc 拷贝一份【只要真类】的表
+//     objc_getClassList()   → 只读已登记的类表（不 realize），**但会把 metaclass 一起给出来**
+//   所以我们要自己把 metaclass 滤掉，才能保持和原来一样的语义（只扫真类，不多扫一倍）。
+//   ★ 顺带：`class_isMetaClass()` 对"还没 realize 的类"也读得对 ——
+//     因为它读的是 data()->flags，而 data() 对未 realize 的类会指向一个"前部布局与 class_rw_t
+//     刻意兼容"的假 rw（flags 就是 ro->flags）。我们在同一个循环里对同一批类调 class_getName()
+//     已经读通了（否则 scanned/hitNames 两个计数根本不会动），走的是同一条 data()->ro 路径。
+static Class *XNRCopyClassList(unsigned int *outCount) {
+    if (outCount) *outCount = 0;
+    // 第一问：有多少个（buffer = NULL → 只返回数量，不拷任何东西）
+    int n = objc_getClassList(NULL, 0);
+    if (n <= 0) return NULL;
+
+    Class *buf = (Class *)malloc(sizeof(Class) * (size_t)n);
+    if (!buf) return NULL;
+
+    int got = objc_getClassList(buf, n);      // 第二问：真的拷出来
+    if (got <= 0) { free(buf); return NULL; }
+    if (got > n)  got = n;                    // 保险：契约上是 min(count, bufferLen)，但别赌
+
+    // 滤掉 metaclass，并且就地压缩（不开第二块内存）
+    unsigned int k = 0;
+    for (int i = 0; i < got; i++) {
+        Class c = buf[i];
+        if (!c) continue;
+        if (class_isMetaClass(c)) continue;
+        buf[k++] = c;
+    }
+    if (outCount) *outCount = k;
+    return buf;
+}
+
 static int XNRInstallNarrow(void) {
     // 有人在装（例如后台早期路径）→ 立刻让开，**绝不在主队列上等自旋锁**
     if (__sync_lock_test_and_set(&gInstalling, 1)) return 0;
@@ -1165,7 +1297,16 @@ static int XNRInstallNarrow(void) {
         NSMutableArray *names = gHookedNames;
         NSMutableArray *notes = [NSMutableArray array];
         unsigned int count = 0;
-        Class *list = objc_copyClassList(&count);
+        // ★★★ v1.0.8：这里从 objc_copyClassList 换成了 XNRCopyClassList
+        //   （= objc_getClassList + 滤 metaclass，**不触发 realizeAllClasses**）。
+        //   并且把"取类表"和"遍历"分开计时 —— 下一次数据就能直接证明/否证那个 1.3 秒到底在哪一步。
+        double c0 = XNRNow();
+        Class *list = XNRCopyClassList(&count);
+        double c1 = XNRNow();
+        if (gClassListMs < 0) {
+            gClassListMs     = c1 - c0;
+            gClassListCount  = (int)count;
+        }
         if (list) {
             for (unsigned int i = 0; i < count; i++) {
                 Class c = list[i];
@@ -1179,10 +1320,13 @@ static int XNRInstallNarrow(void) {
             }
             free(list);
         }
+        double c2 = XNRNow();
+        if (gClassListLoopMs < 0) gClassListLoopMs = c2 - c1;
         XNRRefreshGateInfo();
-        XNRLogLine(@"=== v%s 窄快扫（只挑名字含 Refresh 的类）：扫 %d 类 / 命中 %d 类 / "
-                   @"新增 beginRefreshing %d 个 / 累计挂钩 %d 处",
-                   kVersion, scanned, hitNames, n, gPatchCount);
+        XNRLogLine(@"=== v%s 窄快扫：取类表 %.0f ms（%d 个类）/ 遍历 %.0f ms / "
+                   @"扫 %d 类 / 命中 %d 类 / 新增 beginRefreshing %d 个 / 累计挂钩 %d 处",
+                   kVersion, (c1 - c0) * 1000.0, (int)count, (c2 - c1) * 1000.0,
+                   scanned, hitNames, n, gPatchCount);
         if (notes.count) XNRLogLine(@"     跳过: %@", [notes componentsJoinedByString:@"; "]);
     } @catch (NSException *e) {
         XNRLogLine(@"⚠️ 窄快扫抛异常：%@", e);
@@ -1192,11 +1336,16 @@ static int XNRInstallNarrow(void) {
 }
 
 // —— v1.0.7 分片全量扫描的状态 ——
-#define XNR_CHUNK_CLASSES 400u        // 每片处理多少个类（实测 ~30~60ms/片）
+//   ★ v1.0.8：片改成**双上界** —— 「最多 XNR_CHUNK_CLASSES 个类」**或**「最多 XNR_CHUNK_MAX_MS 毫秒」，
+//   先到者为准。为什么加时间上界：v1.0.7 真机出现「单片最长 164 ms」，而"单片最长"这个量的语义
+//   本来就是"我们最久一次挡住主线程多久"—— 按个数切根本保证不了它，只有按时间切才能给它一个硬上界。
+#define XNR_CHUNK_CLASSES 200u        // 每片最多处理多少个类（v1.0.8：400 → 200）
+#define XNR_CHUNK_MAX_MS  40.0        // 每片最多占用多久（毫秒）；先到者为准
 static Class        *gWalkList     = NULL;   // 本轮类表快照（objc_copyClassList 给的，用完 free）
 static unsigned int  gWalkCount    = 0;
 static unsigned int  gWalkIdx      = 0;
 static int           gChunkTotal   = 0;      // 本轮跑了几片
+static int           gChunkClassTot = 0;     // ★ v1.0.8：本轮类表里一共多少个类（滤掉 metaclass 之后）
 static double        gChunkMaxMs   = 0;      // ★ 单片最长耗时(ms) = "我们最久一次挡住主线程多久"
 static int           gFullNew      = 0;      // 全量分片累计新增的 beginRefreshing 数
 static BOOL          gChunkRun     = NO;     // 分片任务是否正在推进（防重入）
@@ -1222,9 +1371,18 @@ static void XNRInstallChunkStep(void) {
     BOOL done = NO;
     @try {
         if (!gWalkList) {                       // 这一轮的第一片 → 取一份类表快照
-            gWalkList   = objc_copyClassList(&gWalkCount);
+            // ★★★ v1.0.8：同样换成 XNRCopyClassList（不触发 realizeAllClasses）。
+            //   注意：这一片会因此变长一点（把 realize 的账算在它头上），
+            //   所以下面加了"按时间收手"的上界，让它不至于一口气占住主线程。
+            double w0 = XNRNow();
+            gWalkList   = XNRCopyClassList(&gWalkCount);
             gWalkIdx    = 0;
             gChunkTotal = 0;
+            if (gWalkList) {
+                gChunkClassTot = (int)gWalkCount;
+                XNRLogLine(@"=== v%s 全量扫：取类表 %.0f ms（%d 个类，已滤掉 metaclass）",
+                           kVersion, (XNRNow() - w0) * 1000.0, (int)gWalkCount);
+            }
         }
         if (!gWalkList || gWalkCount == 0) {
             if (gWalkList) { free(gWalkList); gWalkList = NULL; }
@@ -1240,14 +1398,28 @@ static void XNRInstallChunkStep(void) {
 
             double t0 = XNRNow();
             int got = 0;
-            for (; gWalkIdx < end; gWalkIdx++) {
+            // ★★ v1.0.8：双上界 —— 类数到顶 **或** 时间到顶，先到者为准。
+            //   每 32 个类才看一次表（XNRNow() 本身也有成本，别把它变成新的热点），
+            //   所以实际的"单片最长"会略微超出 XNR_CHUNK_MAX_MS，但不会超出太多。
+            const unsigned int startIdx = gWalkIdx;
+            const unsigned int end0     = end;
+            while (gWalkIdx < end) {
                 got += XNRScanOneClass(gWalkList[gWalkIdx], names, notes);
+                gWalkIdx++;
+                if ((gWalkIdx & 31u) == 0 && (XNRNow() - t0) * 1000.0 >= XNR_CHUNK_MAX_MS) break;
             }
             double ms = (XNRNow() - t0) * 1000.0;
             if (ms > gChunkMaxMs) gChunkMaxMs = ms;
             gChunkTotal++;
             gFullNew += got;
             if (notes.count) XNRLogLine(@"     跳过: %@", [notes componentsJoinedByString:@"; "]);
+            // 只有"时间上界先到"时才值得记一句 —— 它意味着这一片没把类数配额用完。
+            // （前几片记一下就够了，否则日志会被刷屏）
+            if (gWalkIdx < end0 && gChunkTotal <= 6) {
+                XNRLogLine(@"     第 %d 片按时间收手：这一片只扫了 %u 个类就用了 %.0f ms"
+                           @"（时间上界 %.0f ms）",
+                           gChunkTotal, gWalkIdx - startIdx, ms, XNR_CHUNK_MAX_MS);
+            }
 
             if (gWalkIdx >= gWalkCount) {       // 类表走完了 → 这一轮结束
                 free(gWalkList);
@@ -1275,12 +1447,12 @@ static void XNRInstallChunkStep(void) {
             if (!gTimeline) gTimeline = [NSMutableArray array];
             if (gTimeline.count < 40) {
                 [gTimeline addObject:[NSString stringWithFormat:
-                    @"#%d@%.2fs(全量分%d片/单片最长%.0fms/新增%d处)",
-                    gTryCount, gFullDoneAt, gChunkTotal, gChunkMaxMs, gFullNew]];
+                    @"#%d@%.2fs(共%d类/分%d片/单片最长%.0fms/新增%d处)",
+                    gTryCount, gFullDoneAt, gChunkClassTot, gChunkTotal, gChunkMaxMs, gFullNew]];
             }
         }
-        XNRLogLine(@"=== v%s 全量分片扫描完成：分 %d 片，单片最长 %.0f ms，累计挂钩 %d 处",
-                   kVersion, gChunkTotal, gChunkMaxMs, gPatchCount);
+        XNRLogLine(@"=== v%s 全量分片扫描完成：共 %d 个类，分 %d 片，单片最长 %.0f ms，累计挂钩 %d 处",
+                   kVersion, gChunkClassTot, gChunkTotal, gChunkMaxMs, gPatchCount);
         if (gPatchSkipped) XNRLogLine(@"     ⚠️ 有 %d 处因挂钩表满被跳过", gPatchSkipped);
         return;
     }
@@ -1437,10 +1609,16 @@ static BOOL XNRPresentStats(void) {
         NSString *instStr  = (gInstallOffset < 0)
             ? @"(还没就位)"
             : ((gFirstScanCost >= 0)
-               ? [NSString stringWithFormat:@"启动后 %.2f 秒（窄快扫耗时 %.0f ms%@）",
-                  gInstallOffset, gFirstScanCost * 1000.0,
+               ? [NSString stringWithFormat:@"启动后 %.2f 秒（取类表 %.0f ms + 遍历 %.0f ms%@）",
+                  gInstallOffset,
+                  (gClassListMs < 0 ? 0.0 : gClassListMs * 1000.0),
+                  (gClassListLoopMs < 0 ? 0.0 : gClassListLoopMs * 1000.0),
                   (gFirstScanCost > 0.5) ? @" ⚠️ 还占着主线程" : @""]
                : [NSString stringWithFormat:@"启动后 %.2f 秒", gInstallOffset]);
+        // ★★★ v1.0.8：耗时拆成「取类表 + 遍历」两半显示。
+        //   为什么必须拆开看：v1.0.7 只给了合计 1347 ms，于是我们只能"推断"病根在 objc_copyClassList；
+        //   拆开之后，「取类表」这一半就是**直接证据** —— 它应该从 1347 ms 掉到几毫秒。
+        //   如果它没掉，那说明我判断错了，得换方向（例如把取类表整个搬到后台队列）。
         // ★★ v1.0.7：上面这行与下面这行**取代**了 v1.0.6 的「闸门安装于 / 首轮扫描（开始 X，本轮耗时 Y）」。
         //   口径变了，别按旧版读：
         //     「拦截挂钩就位」= **窄快扫结束**（刷新家族那批挂上）→ 拦截真正可用的时刻
@@ -1448,8 +1626,8 @@ static BOOL XNRPresentStats(void) {
         //   v1.0.6 之前只有一个「闸门安装于」，它同时背了这两件事，才需要"开始/耗时"来消歧义。
         NSString *fullStr  = (gFullDoneAt < 0)
             ? @"(分片推进中…)"
-            : [NSString stringWithFormat:@"启动后 %.2f 秒（分 %d 片，单片最长 %.0f ms）",
-               gFullDoneAt, gChunkTotal, gChunkMaxMs];
+            : [NSString stringWithFormat:@"启动后 %.2f 秒（共 %d 个类 / 分 %d 片 / 单片最长 %.0f ms）",
+               gFullDoneAt, gChunkClassTot, gChunkTotal, gChunkMaxMs];
         NSString *lastTry  = (gLastTryOffset < 0) ? @"(还没扫过)" : [NSString stringWithFormat:@"启动后 %.2f 秒", gLastTryOffset];
         // ★ 同上：时间线也要在锁里取快照（后台安装线程可能正在追加）
         NSString *timeline = nil;
@@ -1474,6 +1652,9 @@ static BOOL XNRPresentStats(void) {
         // ★ v1.0.7：新增"离开前台"的时刻 —— 用来判断「reloadData 时刻」里那些簇
         //   到底是"用户自己下拉"还是"切回来时 App 自己刷的"。v1.0.6 就是缺这个锚点而无法判断。
         NSString *bgLn      = XNRFmtTimes(gBgAt, gBgCount, 8);
+        // ★ v1.0.8：再补「真的进了后台」—— 用来把 willResignActive 的"误触发"排除掉
+        //   （下拉通知中心/控制中心也会发 willResignActive，那时 App 并没有切走）。
+        NSString *bgEnterLn = XNRFmtTimes(gBgEnterAt, gBgEnterCount, 8);
         NSString *pollFirstLn = XNRFmtOff(gPollFirstSampleAt);
         // ★ reloadData 的时刻数组是**跨线程**的（挂钩可能来自后台线程，弹窗在主线程读），
         //   所以读端要按和写端对称的纪律取：**先屏障，再把 count 读进局部变量**，
@@ -1531,6 +1712,7 @@ static BOOL XNRPresentStats(void) {
              "★ 时间轴（把「那一次刷新」钉在哪一秒；全是只读观测）\n"
              "  切前台时刻             %@\n"
              "  切后台时刻             %@\n"
+             "  真进后台时刻            %@\n"
              "  轮询首次采样            %@\n"
              "  reloadData 时刻          %@\n"
              "  ★ 最大 contentInset.top %@\n\n"
@@ -1564,7 +1746,7 @@ static BOOL XNRPresentStats(void) {
             gPollPullMax,
             gPollPullPage ?: @"(还没见到)",
             pullDetail,
-            fgLn, bgLn, pollFirstLn, reloadLn, insetLn,
+            fgLn, bgLn, bgEnterLn, pollFirstLn, reloadLn, insetLn,
             gAllowEmpty, gAllowUser, gAllowGrace, gAllowFooter, gAllowCool, gAllowNoInfo,
             timeline, cls, hints];
 
@@ -1680,9 +1862,11 @@ static int XNRInstallAttempt(void) {
     double t1 = XNRNow();
     if (gFirstScanCost < 0) {
         gFirstScanCost = t1 - t0;
-        XNRLogLine(@"=== v%s 窄快扫耗时 %.0f ms —— 这一下才是我们挡住主线程的时间"
-                   @"（v1.0.6 之前是一整块 2840 ms）",
-                   kVersion, gFirstScanCost * 1000.0);
+        XNRLogLine(@"=== v%s 窄快扫整块耗时 %.0f ms（其中取类表 %.0f ms / 遍历 %.0f ms）"
+                   @"—— 这两半才是「我们挡住主线程」的账（v1.0.7 它们合起来是 1347 ms）",
+                   kVersion, gFirstScanCost * 1000.0,
+                   (gClassListMs < 0 ? 0.0 : gClassListMs * 1000.0),
+                   (gClassListLoopMs < 0 ? 0.0 : gClassListLoopMs * 1000.0));
     }
 
     // ② 全量分片扫：只启动一次，之后由它自己一片一片推进（片间让出主队列）。
@@ -1978,6 +2162,16 @@ static void XNRInit(void) {
         XNRPhaseLoad();
         XNRMarkPhase(XNR_PHASE_CONSTRUCTOR);
 
+        // ★★★ v1.0.8：**轮询排在安装前面**（顺序变了，就这两块调了个位置）。
+        //   为什么：主队列是先进先出。安装块（尤其它里面那次取类表）如果排在前面，
+        //   就会把轮询的第一次采样整个顶到它后面去 —— v1.0.7 真机数据里
+        //   `轮询首次采样 2.4s ≈ 拦截挂钩就位 2.17s + 0.15s` 就是这个现象。
+        //   轮询是**唯一不依赖任何挂钩**的观测通道，它的第一次采样必须尽可能早。
+        //   这里只调顺序，不改任何逻辑。
+        dispatch_async(dispatch_get_main_queue(), ^{
+            XNRPollTick(0);
+        });
+
         // ★★★ v1.0.4 主路径：主队列（= v1.0.2 那条真机验证过不闪退的路径）
         //     构造函数里排的块，会在主线程第一次有空时**最先**跑（排在 App 自己的任务前面）。
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -1994,11 +2188,6 @@ static void XNRInit(void) {
                 @autoreleasepool { XNRDyldWaitStep(0); }
             });
         }
-
-        // 只读观测：低频轮询（refreshControl.isRefreshing + 列表是否被程序性拉下）
-        dispatch_async(dispatch_get_main_queue(), ^{
-            XNRPollTick(0);
-        });
 
         // 切回前台时汇报一次统计（含稳定态检查）
         // ★★ v1.0.6：**在通知里立刻**记下时刻（不要等那 0.6 秒的延后）——
@@ -2033,6 +2222,25 @@ static void XNRInit(void) {
             if (gStartTime > 0 && gBgCount < 8) {
                 gBgAt[gBgCount] = XNRNow() - gStartTime;
                 gBgCount++;
+            }
+        }];
+
+        // ★★ v1.0.8：再记一条「真的进了后台」。
+        //   为什么 willResignActive 一条不够（这是 v1.0.7 数据逼出来的）：
+        //   willResignActive **也会被"下拉通知中心 / 控制中心 / 来电横幅"触发**，那时 App 并没有切走。
+        //   v1.0.7 数据里 `切后台时刻 12.1` 紧跟着 `reloadData 时刻 12.3` ——
+        //   那一簇到底是"用户切走了"还是"只是拉了一下通知中心"，靠这两行的**差集**才能判。
+        //   哪一行出现、哪一行没出现，含义完全不同：
+        //     切后台有 → 真进后台有   = 用户真的切走 / 锁屏
+        //     切后台有 → 真进后台没有 = 只是下拉了通知中心之类，App 还在前台
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification *note) {
+            (void)note;
+            if (gStartTime > 0 && gBgEnterCount < 8) {
+                gBgEnterAt[gBgEnterCount] = XNRNow() - gStartTime;
+                gBgEnterCount++;
             }
         }];
     }
