@@ -1,0 +1,9 @@
+Package: com.workbuddy.xhsnoautorefresh
+Name: XhsNoAutoRefresh
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: 禁止小红书 iOS 客户端「一打开就自动刷新」，完整保留手动下拉刷新与上拉加载更多。目标包名 com.xingin.discover（注意：com.xingin.xhs 是安卓包名）。v1.0.0 诊断版：拦截点只有刷新控件的 -beginRefreshing 一个，且命中规则是「谁自己实现了这个方法、签名 v@: 就是刷新控件」——不依赖 MJRefresh 等具体框架；全程不写任何几何值、不代调 App 的语义 API、不自动弹窗；用「列表里还没有内容 → 这次是在加载首屏 → 放行」替代固定启动宽限，因此既能保住首屏、又能拦到「一打开就刷新」那一次。切回前台弹一次统计窗（含首次触发发生在启动后几秒、以及每一条放行的具体原因），确认可用后把 kShowAlert 改成 NO 即可。零 Logos 钩子、不依赖 CydiaSubstrate。
+Homepage: https://github.com/
+Maintainer: WorkBuddy
+Author: WorkBuddy
+Section: Tweaks
