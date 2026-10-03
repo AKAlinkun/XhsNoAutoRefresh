@@ -65,6 +65,29 @@
 //            正是我们一直在抱怨的那件事（v1.0.2 的「4.2 秒」多半也是同一成因）。
 //          本版**先把口径说清楚并单独显示耗时**，机制不动（一次只动一个变量）；
 //          真要修（把一轮扫不完的活拆到多个 runloop 周期）留给下一版。
+//
+// v1.0.6 是【时间轴版】—— 只加四个只读观测，仍然一个行为都不改。
+//        起因：用户装完 v1.0.5 后回报「**仍然有自动刷新**」，并把整段弹窗文本粘了回来：
+//          闸门安装于   启动后 3.95 秒
+//          首轮扫描     开始 0.95s，本轮耗时 2.99s  ⚠️ 这一下是占着主线程的
+//          reloadData   14 次   首次 启动后 4.0s
+//        三行摆在一起，结论很尴尬也很关键：
+//          ① **延迟是我们自己造的**：扫描占住主队列 2.99 秒 → App 的首屏重载被挤到 3.95s 之后
+//             （reloadData 首次 4.0s 紧跟在闸门安装之后，几乎就是被我们"顶"出来的那一次）。
+//          ② **我们因为自己造成的延迟，错过了自己的观测窗口**：轮询也排在主队列上，
+//             所以它第一次真正采样要等扫描跑完 —— `①`/`②` 那两个 0 因此**在观测上不可信**。
+//          ③ **判据有盲区**：标准下拉刷新（MJRefresh / UIRefreshControl）进入刷新态时
+//             `inset.top += 头高度`，而 `contentOffset.y` 同步跟到 `-inset.top`，
+//             于是 `(-y) - inset.top` **恒为 0** —— 光看 offset 永远抓不到"已进入刷新态"。
+//             必须改看 `adjustedContentInset.top` 有没有【变大】。
+//        所以本版把时间轴钉死，四个数各回答一个问题：
+//          ① 切前台时刻序列 —— 用户"看到刷新后立刻切回来"的那一刻，就是那次刷新的【上界】。
+//             这是唯一能把"那一次刷新"直接框住的数，而它此前完全缺失。
+//          ② 轮询首次采样时刻 —— 证实/推翻上面第 ② 条推断。
+//          ③ reloadData 时刻序列 —— "14 次"是总量，序列才看得出它们落在哪。
+//          ④ 最大 adjustedContentInset.top + 达标时刻 + 当时页面 —— 抓"刷新头占位"。
+//        ★ 仍然严格守铁律 3：这四项**只读**（读 offset、读 inset、读时刻），
+//          不写任何几何值、不改任何行为 —— 先看清再动手。
 // ---------------------------------------------------------------------------
 
 #import <Foundation/Foundation.h>
@@ -94,7 +117,7 @@ static double kCooldownSecs      = 30.0;
 // ★ v1.0.2：包名不再作为「装不装」的硬开关（见 XNRInstallWhenReady 注释）。
 //   这里只用于日志和弹窗展示，方便一眼核对是不是目标 App。
 static const char *kTargetBundlePrefix = "com.xingin.";
-static const char *kVersion            = "1.0.5";
+static const char *kVersion            = "1.0.6";
 
 // ★★★ v1.0.4：早期安装默认【关闭】。
 //
@@ -292,6 +315,36 @@ static NSString *gPollPullPage = nil;   // 首次见到时所在的页面
 //            ③ 它顶部那几个子视图是什么类（刷新头一定在其中）。
 static NSString *gPollPullDetail = nil;
 static BOOL      gPollPullPullDone = NO;
+
+// ★★★ v1.0.6：把"时间轴"钉住的四个只读观测。
+//
+//   起因（★ 一条被真机数据逼出来的认识）：v1.0.5 的弹窗给出
+//       闸门安装于   启动后 3.95 秒
+//       首轮扫描     开始 0.95s，本轮耗时 2.99s  ⚠️
+//       reloadData   14 次   首次 启动后 4.0s
+//   三行放在一起看，指向一件很尴尬的事：**我们自己的扫描把 App 的启动推迟了。**
+//   扫描占住主队列 2.99 秒 → App 的首屏重载被挤到 3.95 秒之后。
+//   更糟的是：**轮询也排在主队列上**，所以它第一次真正采样也要等扫描跑完 ——
+//   也就是说，**我们既制造了延迟，又因为延迟而错过了观测窗口。**
+//   但当时弹窗里**没有"轮询什么时候开始采样的"这个数**，所以只能推断，不能证实。
+//
+//   所以补四个数，把时间轴钉死（**全部只读，一个行为都不改**）：
+//     ① 切前台时刻序列 —— 用户"看到刷新后立刻切回来"的那一刻，就是那次刷新的【上界】。
+//        这是唯一能直接把"那一次刷新"框住的数，而它此前完全缺失。
+//     ② 轮询首次采样时刻 —— 用于证实/推翻上面那个"轮询被自己挡住"的推断。
+//     ③ reloadData 时刻序列 —— 光有"14 次"不够，要看它们分布在时间轴上的哪里。
+//     ④ 最大 adjustedContentInset.top + 达标时刻 —— ★ 抓到"靠改 inset 让出空间"的刷新头。
+//        标准下拉刷新（MJRefresh / UIRefreshControl）进入刷新态时会 inset.top += 头高度，
+//        而 contentOffset 同步跟到 -inset.top，于是 ② 那个判据 (-y)-inset.top 恒为 0！
+//        换句话说：**光看 offset 是抓不到"已进入刷新态"的，必须看 inset 有没有变大。**
+static double   gPollFirstSampleAt = -1;    // ② 轮询第一次真正采样发生的时刻
+static double   gFgAt[8];                   // ① 每次切前台（didBecomeActive）的时刻
+static int      gFgCount = 0;
+static double   gReloadAt[16];              // ③ 每次 -reloadData 的时刻（只留前 16 个）
+static int      gReloadAtCount = 0;
+static double   gMaxInsetTop = -1;          // ④ 见过的最大 adjustedContentInset.top
+static double   gMaxInsetAt  = -1;          //    首次达到该值的时刻
+static NSString *gMaxInsetPage = nil;       //    那时在哪个页面
 
 static NSTimeInterval gStartTime     = 0;
 static NSTimeInterval gLastAllow     = 0;
@@ -873,6 +926,16 @@ static void XNRProbeNote(int *counter, double *firstField) {
 // ① 列表重载 —— 刷新必然伴随数据重载，用它可以定位「那一刻」和调用来源
 static void XNRHookedReloadData(id self, SEL _cmd) {
     XNRProbeNote(&gProbeReload, &gProbeReloadFirst);
+    // ★ v1.0.6：把每次 reloadData 的**时刻**也记下来（最多 16 个）。
+    //   起因：v1.0.5 只告诉我们"14 次、首次 4.0s"，但**14 次分布在时间轴上的哪里完全不知道** ——
+    //   而"哪一次是那多余的刷新"恰恰要靠时刻去对。
+    //   ★ 发布纪律（和 gPatches 一样）：先写数组元素 → 屏障 → 再让 count 涨。
+    //     reloadData 有从后台线程调的可能，而主线程在弹窗里读这个数组。
+    if (gReloadAtCount < 16 && gStartTime > 0) {
+        gReloadAt[gReloadAtCount] = XNRNow() - gStartTime;
+        __sync_synchronize();
+        gReloadAtCount++;
+    }
     if (gProbeReload <= 30) {
         XNRRecordEventKind([NSString stringWithFormat:@"reloadData @ %@", XNRClassName(self)],
                            XNRPageOfAny(self), NO, XNREvReload);
@@ -1114,6 +1177,18 @@ static NSString *XNRFmtOff(double t) {
     return [NSString stringWithFormat:@"启动后 %.1fs", t];
 }
 
+// ★ v1.0.6：把一串时刻格式化成 `0.4 4.0 4.1 5.2 …`（用于时间轴那几行）
+//   maxN 是数组的实际容量上限，读端先读 count 再读元素（配发布屏障，见写入处）
+static NSString *XNRFmtTimes(const double *arr, int count, int maxN) {
+    if (count <= 0) return @"(无)";
+    if (count > maxN) count = maxN;            // 防"count 已涨、元素没写完"读到越界
+    NSMutableArray *a = [NSMutableArray array];
+    for (int i = 0; i < count; i++) {
+        [a addObject:[NSString stringWithFormat:@"%.1f", arr[i]]];
+    }
+    return [a componentsJoinedByString:@" "];
+}
+
 // 返回 YES = 已经不需要再试了（弹成功 / 或本来就不需要弹）
 static BOOL XNRPresentStats(void) {
     if (!kShowAlert) return YES;                     // 关掉了，没什么可重试
@@ -1190,6 +1265,28 @@ static BOOL XNRPresentStats(void) {
         NSString *pollPage = gPollPage ?: @"(还没见到)";
         NSString *pullDetail = gPollPullDetail.length ? gPollPullDetail : @"(还没抓到现场)";
 
+        // ★★ v1.0.6：时间轴四行。
+        //   为什么要单开一段：v1.0.5 的数据告诉我们「闸门装于 3.95s、首屏 reloadData 在 4.0s」，
+        //   而那一轮扫描自己就占了 2.99 秒主线程 —— 也就是说 **延迟是我们自己造的**。
+        //   要判断"那一次刷新"到底落在哪一秒，必须把四个时刻摆进同一条时间轴：
+        //     ① 切前台时刻（用户看到刷新后立刻切回来的那一刻 = 那次刷新的【上界】）
+        //     ② 轮询首次采样时刻（证实/推翻"轮询也被自己的扫描挡住"）
+        //     ③ reloadData 时刻序列（光有 14 次不够，要看分布）
+        //     ④ 最大 adjustedContentInset.top（★ 唯一能抓到"刷新头占位"的量）
+        //   ★ 这四行全是只读观测，一个行为都不改。
+        NSString *fgLn      = XNRFmtTimes(gFgAt, gFgCount, 8);
+        NSString *pollFirstLn = XNRFmtOff(gPollFirstSampleAt);
+        // ★ reloadData 的时刻数组是**跨线程**的（挂钩可能来自后台线程，弹窗在主线程读），
+        //   所以读端要按和写端对称的纪律取：**先屏障，再把 count 读进局部变量**，
+        //   然后再读元素。少了这一步，理论上可能读到"count 已涨、元素没写完"的半成品。
+        __sync_synchronize();
+        int reloadAtN = gReloadAtCount;
+        NSString *reloadLn  = XNRFmtTimes(gReloadAt, reloadAtN, 16);
+        NSString *insetLn   = (gMaxInsetTop < 0)
+            ? @"(没见到更大的 inset → 全程没有刷新头占过位)"
+            : [NSString stringWithFormat:@"%.1f pt   首次 %.2fs   页面 %@",
+               gMaxInsetTop, gMaxInsetAt, gMaxInsetPage ?: @"(未识别)"];
+
         // ★★ v1.0.4：把"上一次启动止步于哪一阶段"摆到最上面 —— 闪退唯一的见证者。
         NSString *prevLn = nil;
         if (gPrevLaunchNo <= 0) {
@@ -1232,6 +1329,11 @@ static BOOL XNRPresentStats(void) {
              "     最深拉下                %.0f pt\n"
              "     首次所在页面            %@\n"
              "     ★ 现场                  %@\n\n"
+             "★ 时间轴（把「那一次刷新」钉在哪一秒；全是只读观测）\n"
+             "  切前台时刻             %@\n"
+             "  轮询首次采样            %@\n"
+             "  reloadData 时刻          %@\n"
+             "  ★ 最大 contentInset.top %@\n\n"
              "放行原因明细（判断插件是否按预期工作的关键）\n"
              "  列表还没内容(首屏加载)  %d\n"
              "  用户自己在拖            %d\n"
@@ -1262,6 +1364,7 @@ static BOOL XNRPresentStats(void) {
             gPollPullMax,
             gPollPullPage ?: @"(还没见到)",
             pullDetail,
+            fgLn, pollFirstLn, reloadLn, insetLn,
             gAllowEmpty, gAllowUser, gAllowGrace, gAllowFooter, gAllowCool, gAllowNoInfo,
             timeline, cls, hints];
 
@@ -1566,6 +1669,22 @@ static void XNRPollScan(UIView *v) {
                 }
             }
 
+            // ★★ v1.0.6 第四路观测：**adjustedContentInset.top 有没有变大**。
+            //   为什么必须要这一路：标准下拉刷新进入刷新态的动作是
+            //        inset.top += 刷新头高度；  contentOffset.y = -(新 inset.top)
+            //   两者同步变化 → 下面那个 (-offset.y) - inset.top 的判据**恒等于 0**，
+            //   于是"已经进入刷新态"这件事我们**根本看不见**。
+            //   而 inset.top 变大是躲不掉的：刷新头要占位，就必须扩 inset。
+            //   ★ 只读，而且不受"用户手动下拉"影响（用户下拉时 inset 不变，只有真进入刷新态才变）。
+            double it = sv.adjustedContentInset.top;
+            if (it > gMaxInsetTop + 1.0 && gStartTime > 0) {
+                gMaxInsetTop  = it;
+                gMaxInsetAt   = XNRNow() - gStartTime;
+                gMaxInsetPage = XNRPageOfAny(v) ?: @"(未识别)";
+                XNRLogLine(@"🔎 出现更大的 contentInset.top %.1f（刷新头占位？）：启动后 %.2fs  页面: %@",
+                           it, gMaxInsetAt, gMaxInsetPage ?: @"?");
+            }
+
             // ★ v1.0.3：第二路观测 —— 列表被"程序性地"拉下去了吗？（纯只读，见上面变量处的说明）
             //   条件：超出顶部 30pt 以上，且没有任何人在拖 / 没有惯性滑动
             //   → 那就是 App 自己在把列表往下拉（露出刷新圈圈），正是我们要抓的那一下。
@@ -1621,6 +1740,15 @@ static void XNRPollTick(int tick) {
                    dispatch_get_main_queue(), ^{
         @try {
             gPollTicks++;
+            // ★★ v1.0.6：记下"轮询第一次真正采样"的时刻。
+            //   这一条是用来证实/推翻一个推断的：轮询和首轮扫描**都排在主队列上**，
+            //   而扫描是先排的、且一口气占住主线程 —— 所以轮询的第一次采样要等它跑完。
+            //   如果这个数 ≈ 闸门安装于，说明我们"既制造了延迟、又因为延迟错过了观测窗口"。
+            if (gPollFirstSampleAt < 0 && gStartTime > 0) {
+                gPollFirstSampleAt = XNRNow() - gStartTime;
+                XNRLogLine(@"🔎 轮询第一次真正采样：启动后 %.2fs（闸门安装于 %.2fs）",
+                           gPollFirstSampleAt, gInstallOffset);
+            }
             for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
                 if (![sc isKindOfClass:[UIWindowScene class]]) continue;
                 for (UIWindow *w in ((UIWindowScene *)sc).windows) XNRPollScan(w);
@@ -1675,11 +1803,19 @@ static void XNRInit(void) {
         });
 
         // 切回前台时汇报一次统计（含稳定态检查）
+        // ★★ v1.0.6：**在通知里立刻**记下时刻（不要等那 0.6 秒的延后）——
+        //   因为这个时刻就是"用户看到刷新后切回来"的那一刻，是**框住那一次刷新的上界**，
+        //   也是整个弹窗里最有用的一条时间锚点。
+        //   注意 didBecomeActive 在 App 启动时也会触发一次，所以第 1 条 ≈ 启动时刻（正常）。
         [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
                                                           object:nil
                                                            queue:[NSOperationQueue mainQueue]
                                                       usingBlock:^(NSNotification *note) {
             (void)note;
+            if (gStartTime > 0 && gFgCount < 8) {
+                gFgAt[gFgCount] = XNRNow() - gStartTime;
+                gFgCount++;
+            }
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 XNRStatsRetry(0);

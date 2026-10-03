@@ -114,6 +114,15 @@ def _selftest():
     mutant_ok("C 字符串当对象用（漏写 @）",
               '[NSString stringWithFormat:@"XhsNoRefresh v%s  ✅ 已复制到剪贴板", kVersion]',
               '[NSString stringWithFormat:"XhsNoRefresh v%s ok", kVersion]')
+    # ★ v1.0.6：占位符【类型】位置（规则 11c）。
+    #   「个数对、类型不对」也是崩溃级，而 v1.0.6 一次加了 4 个新的 %@，正是高发场景。
+    #   这两个变异体都保持实参个数不变，所以只会命中 11c、不会命中 11 —— 测的就是新规则本身。
+    mutant_ok("占位符类型不符（%@ 吃到 int 实参）",
+              "            gProbeReload, XNRFmtOff(gProbeReloadFirst),",
+              "            gProbeReload, gProbeReload,")
+    mutant_ok("占位符类型不符（%d 吃到对象实参）",
+              "            gProbeReload, XNRFmtOff(gProbeReloadFirst),",
+              "            kVersion, XNRFmtOff(gProbeReloadFirst),")
     # 这一条是故意造括号不平衡，不做平衡校验
     cases.append(("括号不平衡", base + "\nstatic void broken(void) {\n"))
 
@@ -128,6 +137,13 @@ def _selftest():
                  "    if (gLaunchNo <= 0) return;\n"
                  '    const char *zn = (strcmp(name, "?") == 0) ? "a" : "b";\n'
                  "    (void)zn;")
+    # 规则 11c 的"拿不准就沉默"：三元、下标、强制转换 一律不算类型 ——
+    #   ★ 这是本规则的命门。它一旦开始猜，就会误报；误报会逼着人把正确代码改坏。
+    mutant_clean("类型拿不准的实参不报警（三元/下标/强转）",
+                 "    if (gLaunchNo <= 0) return;",
+                 "    if (gLaunchNo <= 0) return;\n"
+                 '    NSString *zz = [NSString stringWithFormat:@"%@ %.1f", (id)nil, pool[0]];\n'
+                 "    (void)zz;")
 
     ok = True
     tmpdir = tempfile.mkdtemp(prefix="xhscheck_")
@@ -486,6 +502,131 @@ def count_placeholders(fmt):
     return n
 
 
+# ── 11c. 占位符的【类型】与实参位置对不对得上 ───────────────────────────────
+# 规则 11 只数【个数】。但「个数对、类型不对」同样是崩溃级：
+#     [NSString stringWithFormat:@"%@", gSomeCount]   → 把整数当对象解引用 → EXC_BAD_ACCESS
+# 而 v1.0.6 恰好一次性加了 4 个新的 %@（时间轴那四行），这种错最容易在
+# 「格式串上插了一行、实参忘了跟着改」或「复制粘贴换了变量名」时发生。
+#
+# ★★ 已知盲区（做不到，也不该假装做到）：**同类型实参之间的顺序调换**。
+#    四个 %@ 配四个 NSString*，谁在前谁在后，静态检查无论如何看不出来 ——
+#    只能靠「实参顺序与格式串自上而下逐行对应」这条人工纪律。
+#    ★ 本项目已经栽过两次「检查器规则写太激进」的假阳性，而假阳性比漏报更危险，
+#      所以本规则**只在类型能确定时才说话**，拿不准一律沉默。
+_SCALAR_TYPES = ("unsigned", "signed", "int", "long", "short", "char", "BOOL", "bool",
+                 "float", "double", "NSInteger", "NSUInteger", "CGFloat", "NSTimeInterval",
+                 "size_t", "ptrdiff_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+                 "int8_t", "int16_t", "int32_t", "int64_t")
+
+
+def _strip_comments(text):
+    """剥离注释后建立变量表 —— 否则注释里的 `*foo`、`(NSString *)` 会被当成变量声明。
+    注意：调用点传进来的 `s` 其实上面已经剥过一次注释了（见本文件 189~195 行）；
+    这里保留独立的一份是为了让本段规则**自成一体**，不依赖"上面恰好剥过"这个隐含前提。"""
+    out = []
+    for ln in text.split("\n"):
+        if ln.lstrip().startswith("//"):
+            continue
+        if '"' not in ln:
+            k = ln.find("//")
+            if k >= 0:
+                ln = ln[:k]
+        out.append(ln)
+    return "\n".join(out)
+
+
+_code = _strip_comments(s)
+_scalar_vars = set()
+for _m in re.finditer(r"\b(?:%s)\s+([A-Za-z_]\w*)" % "|".join(_SCALAR_TYPES), _code):
+    _scalar_vars.add(_m.group(1))
+# 指针声明：本项目统一写成 `Type *name`（星号紧贴变量名），所以这里不允许星号后有空格 ——
+# 否则 `a * b` 这种乘法也会被当成指针声明，凭空造出假变量。
+_object_vars = set()
+for _m in re.finditer(r"\*([A-Za-z_]\w*)", _code):
+    _object_vars.add(_m.group(1))
+
+
+def placeholder_kinds(fmt):
+    """按出现顺序返回每个占位符要的类型：'obj' / 'scalar' / None(不知道)。
+    遇到 `*` 宽度/精度（会吃掉额外实参，位置对应关系就乱了）直接放弃整条串。"""
+    out, i = [], 0
+    while i < len(fmt):
+        if fmt[i] != "%":
+            i += 1
+            continue
+        if i + 1 < len(fmt) and fmt[i + 1] == "%":
+            i += 2
+            continue
+        j = i + 1
+        while j < len(fmt) and fmt[j] in "-+ #0'":
+            j += 1
+        if j < len(fmt) and fmt[j] == "*":          # 宽度来自实参 → 位置对不上，放弃
+            return None
+        while j < len(fmt) and fmt[j].isdigit():
+            j += 1
+        if j < len(fmt) and fmt[j] == ".":
+            j += 1
+            if j < len(fmt) and fmt[j] == "*":
+                return None
+            while j < len(fmt) and fmt[j].isdigit():
+                j += 1
+        while j < len(fmt) and fmt[j] in "hlLqjzt":
+            j += 1
+        if j >= len(fmt):
+            break
+        c = fmt[j]
+        if c == "@":
+            out.append("obj")
+        elif c in "diouxXceEfFgGaA":
+            out.append("scalar")
+        else:
+            out.append(None)                        # %s %p %n … 不管
+        i = j + 1
+    return out
+
+
+def _arg_kind(a):
+    """判断单个实参的类型：'obj' / 'scalar' / None(拿不准)。
+    ★ 只在能确定时才返回，其余一律 None —— 宁可漏报也不误报。"""
+    a = a.strip()
+    if not a:
+        return None
+    if a.startswith('@"') or a.startswith("@["):
+        return "obj"
+    if re.fullmatch(r"-?\d+(?:\.\d+)?[fFuUlL]*", a) or re.fullmatch(r"0[xX][0-9a-fA-F]+[uUlL]*", a):
+        return "scalar"
+    if re.fullmatch(r"[A-Za-z_]\w*", a):
+        if a in ("nil", "NULL", "YES", "NO", "true", "false"):
+            return None
+        if a in _scalar_vars and a not in _object_vars:
+            return "scalar"
+        if a in _object_vars and a not in _scalar_vars:
+            return "obj"
+        return None
+    return None
+
+
+def check_fmt_types(line_no, fmt, args, api):
+    """逐位置比对「占位符要什么」与「实参是什么」，只在两边都确定时才判。"""
+    kinds = placeholder_kinds(fmt)
+    if kinds is None or len(kinds) != len(args):
+        return
+    for pos, (kd, raw) in enumerate(zip(kinds, args), 1):
+        if kd is None:
+            continue
+        ak = _arg_kind(raw)
+        if ak is None or ak == kd:
+            continue
+        if kd == "obj" and ak == "scalar":
+            add("第 %d 行 %s 的第 %d 个占位符是 %%@（要对象），但第 %d 个实参 `%s` 是数值/标量"
+                " —— 会把整数当对象解引用，运行必崩"
+                % (line_no, api, pos, pos, raw.strip()[:48]))
+        else:
+            add("第 %d 行 %s 的第 %d 个占位符是数值（%%d/%%f 之类），但第 %d 个实参 `%s` 是对象"
+                " —— 会把指针当整数解释（通常是插了一行、实参没跟着改）"
+                % (line_no, api, pos, pos, raw.strip()[:48]))
+
+
 # 11a stringWithFormat:
 for m in re.finditer(r"stringWithFormat\s*:", s):
     fmt, j = leading_literals(s, m.end())
@@ -534,6 +675,9 @@ for m in re.finditer(r"stringWithFormat\s*:", s):
     if np != len(args):
         add("第 %d 行 stringWithFormat: 有 %d 个占位符，但传了 %d 个实参"
             % (s[:m.start()].count("\n") + 1, np, len(args)))
+    else:
+        # ★ v1.0.6：个数对了还要看【类型位置】对不对（规则 11c）
+        check_fmt_types(s[:m.start()].count("\n") + 1, fmt, args, "stringWithFormat:")
 
 # 11b 本工程自己的 XNRLogLine(fmt, ...)
 for m in re.finditer(r"XNRLogLine\s*\(", s):
@@ -552,6 +696,9 @@ for m in re.finditer(r"XNRLogLine\s*\(", s):
     if np != len(args) - 1:
         add("第 %d 行 XNRLogLine 的格式串有 %d 个占位符，但传了 %d 个实参"
             % (s[:m.start()].count("\n") + 1, np, len(args) - 1))
+    else:
+        # ★ v1.0.6：同上（规则 11c）
+        check_fmt_types(s[:m.start()].count("\n") + 1, fmt, args[1:], "XNRLogLine")
 
 # ── 12. 加锁的函数必须用 @finally 释放锁 ────────────────────────────────────
 # ObjC 的 return 和异常都【不会】执行 @try 之后的普通语句 —— 只有 @finally 保证一定跑到。
@@ -720,4 +867,4 @@ if problems:
 
 print("静态自检通过 ✓  常量齐全 / 零 Logos·substrate / 零几何写入 / 无非法语义调用 / "
       "探针原样放行 / 无静态初始化 @\" / 括号平衡 / 函数唯一 / 先定义后调用 / LF 无 BOM / "
-      "占位符数相符 / 加锁配 @finally / C 字符串无非 ASCII / C 字符串没被当对象用")
+      "占位符数相符 / 占位符类型相符 / 加锁配 @finally / C 字符串无非 ASCII / C 字符串没被当对象用")
