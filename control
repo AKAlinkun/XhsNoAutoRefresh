@@ -1,8 +1,8 @@
 Package: com.workbuddy.xhsnoautorefresh
 Name: XhsNoAutoRefresh
-Version: 1.0.0
+Version: 1.0.2
 Architecture: iphoneos-arm
-Description: 禁止小红书 iOS 客户端「一打开就自动刷新」，完整保留手动下拉刷新与上拉加载更多。目标包名 com.xingin.discover（注意：com.xingin.xhs 是安卓包名）。v1.0.0 诊断版：拦截点只有刷新控件的 -beginRefreshing 一个，且命中规则是「谁自己实现了这个方法、签名 v@: 就是刷新控件」——不依赖 MJRefresh 等具体框架；全程不写任何几何值、不代调 App 的语义 API、不自动弹窗；用「列表里还没有内容 → 这次是在加载首屏 → 放行」替代固定启动宽限，因此既能保住首屏、又能拦到「一打开就刷新」那一次。切回前台弹一次统计窗（含首次触发发生在启动后几秒、以及每一条放行的具体原因），确认可用后把 kShowAlert 改成 NO 即可。零 Logos 钩子、不依赖 CydiaSubstrate。
+Description: 禁止小红书 iOS 客户端「一打开就自动刷新」，完整保留手动下拉刷新与上拉加载更多。v1.0.2 是「探针定位版」——起因是 v1.0.1 真机数据显示：7 个刷新控件全部挂钩成功（含 MJRefresh、XYSpark 自研 Swift 刷新头、React Native 控件），但 -beginRefreshing 一次都没被调用，也就是说这次自动刷新根本不走这个入口，光靠它拦不住。于是本版不改拦截逻辑，只加三个【只读探针】（-reloadData / -endRefreshing / -setState:），只数数、只记一条调用栈、一律原样转交原实现，用来抓出「到底是谁在驱动这次刷新」，并在弹窗里附带「闸门安装于启动后多少秒」以判断是否漏掉了启动瞬间的刷新。零 Logos 钩子、不依赖 CydiaSubstrate、全程不写任何几何值、不代调 App 的语义 API。
 Homepage: https://github.com/
 Maintainer: WorkBuddy
 Author: WorkBuddy
