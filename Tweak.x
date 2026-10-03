@@ -14,12 +14,29 @@
 //        → 这次自动刷新根本不走这个入口。本版【不改拦截逻辑】，只加三个只读探针
 //          （-setState: / -endRefreshing / -reloadData：只数数、记一条栈、原样转交原实现）
 //          外加「闸门安装于启动后多少秒」，用来判断钩子是不是挂晚了。
+// v1.0.3 是【早期安装版】：上一版那个数字给出的答案很干脆 —— 闸门装于「启动后 4.2 秒」，
+//        而刷新发生在 1~2 秒。**不是入口选错，是时间不对。**
+//        本版【只改安装时机这一个机制】：后台队列尽早起步（首轮延迟 40ms）+ 持续重扫到 3 秒
+//        （收编晚加载的框架）+「已扫过的类」哈希集合（让重扫不拖慢 App）。
+//        另加两项只读观测：
+//          ① 轮询 scrollView.refreshControl.isRefreshing —— 回答「那个圈圈是不是 UIRefreshControl」
+//             （它由 scrollView 内部驱动时不走 -beginRefreshing）
+//          ② 轮询 contentOffset / adjustedContentInset —— 「列表是不是被程序性地拉下去了」
+//             这一路【完全不依赖任何挂钩】，能直接给出那一次刷新的时间点和页面。
+//             为的是区分两种都表现为"触发 0"的可能：
+//               (a) 没赶上时间；(b) Swift 对 @objc 但非 dynamic 的方法走 vtable 直接派发，
+//                   根本不经过 objc_msgSend —— 那样钩子挂得再早也不会被调用。
+//        顺带修掉两个只在真机上才看得见的显示问题：弹窗标题中文花屏（%s 在 NSString 格式化里
+//        按平台默认 C 编码 MacRoman 解释，不是 UTF-8）与「挂钩类数」标签错标。
+//        一键回退：kEarlyInstall = NO（改一行即回到 v1.0.2 的主队列路径）。
 // ---------------------------------------------------------------------------
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <ctype.h>
+// 注：v1.0.3 起早期安装改用 dispatch_after 串联，不再需要 <unistd.h>（usleep）。
+//     万一以后要加回阻塞式节流再 import 即可 —— 但请先看 XNREarlyInstallStep 上面的那段说明。
 
 #pragma mark - 配置
 
@@ -40,7 +57,33 @@ static double kCooldownSecs      = 30.0;
 // ★ v1.0.2：包名不再作为「装不装」的硬开关（见 XNRInstallWhenReady 注释）。
 //   这里只用于日志和弹窗展示，方便一眼核对是不是目标 App。
 static const char *kTargetBundlePrefix = "com.xingin.";
-static const char *kVersion            = "1.0.2";
+static const char *kVersion            = "1.0.3";
+
+// ★★★ v1.0.3：只改【安装时机】这一个机制，其余全是只读观测。
+//
+// 真机数据（v1.0.2）把问题钉在了时间上，而不是入口上：
+//     闸门安装于        启动后 4.2 秒
+//     reloadData     13 次   首次 启动后 4.3s
+//     endRefreshing   0 次
+//     setState: 总写入 0 次      ← 连一次都没有
+// 用户的现象是「打开就直接刷新」，发生在启动后 1~2 秒。
+// → **钩子在 4.2 秒才挂上，那一次刷新早就打完了，我们根本没赶上。**
+//   这也解释了为什么所有刷新探针都是 0：不是入口选错了，是时间不对。
+//
+// 为什么原方案会晚到 4.2 秒：v1.0.1/1.0.2 只把安装排到【主队列】上，
+// 而 App 启动时主线程被 dyld 加载几十个框架 + 自己的启动任务占满，
+// 排在上面的任务要等它整段跑完才轮到 —— 于是「排得早」并不等于「跑得早」。
+static BOOL   kEarlyInstall      = YES;   // ★ 后台早期安装（本版唯一的机制改动）
+                                          //   ⚠️ 安全阀：万一装上后【一开就闪退】，把它改成 NO，
+                                          //      即回到 v1.0.2 的主队列路径，其它功能不受影响。
+static double kEarlyFirstDelayMs = 40.0;  // 首次后台扫描前的等待(ms)：给 dyld 一点时间，
+                                          //   避免恰好在镜像加载中途去扫类表
+static double kEarlyRescanSecs   = 3.0;   // ★ 持续重扫到启动后多少秒
+                                          //   必须保留：晚加载的框架（XYSpark、RN 控件）只有等它出现才能挂上
+static double kEarlyIntervalMs   = 80.0;  // 重扫间隔(ms)
+static BOOL   kPollRefreshCtrl   = YES;   // 低频轮询（纯只读）：① refreshControl.isRefreshing
+                                          //   ② 列表有没有被程序性拉下去。上限 70 次（约 21 秒）自动停
+
 
 static const NSInteger kStatePulling = 2;
 
@@ -91,6 +134,9 @@ static NSString *XNRLogPath(void) {
     return [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/XNR_fix.log"];
 }
 
+// ★ v1.0.3：安装改成「后台早期安装 + 主队列兜底」两条路径后，日志会从两个线程写。
+//   `seekToEndOfFile` + `writeData` 不是原子操作，两边同时写会互相覆盖/写花。
+//   → 加一把锁把它串行化。（注意 @try 里不能提前 return，否则会漏掉解锁。）
 static void XNRLogLine(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
@@ -98,17 +144,24 @@ static void XNRLogLine(NSString *fmt, ...) {
 
     NSLog(@"[XNR] %@", msg);
 
+    static NSLock *lock = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [[NSLock alloc] init]; });
+
+    [lock lock];
     @try {
         NSString *path = XNRLogPath();
         NSFileManager *fm = [NSFileManager defaultManager];
         if (![fm fileExistsAtPath:path]) [fm createFileAtPath:path contents:nil attributes:nil];
         NSString *line = [NSString stringWithFormat:@"%@  %@\n", [NSDate date], msg];
         NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-        if (!fh) return;
-        [fh seekToEndOfFile];
-        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-        [fh closeFile];
+        if (fh) {
+            [fh seekToEndOfFile];
+            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        }
     } @catch (NSException *e) { (void)e; }
+    @finally { [lock unlock]; }        // ★ 用 @finally 释放，绝不依赖"走到函数末尾"
 }
 
 #pragma mark - 计数器 / 运行状态
@@ -132,6 +185,42 @@ static int  gAllowNoInfo = 0;    // 拿不到判断依据（宁可漏拦）
 static BOOL gInstalled = NO;
 static int  gInstallTries = 0;   // 第几轮尝试安装（用于日志与重试上限）
 static NSString *gRealBundleID = nil;   // ★ 本进程真实包名 —— 排障第一信息，直接打进弹窗
+
+// ★★ v1.0.3：安装时间线（只读观测）
+//    要回答的问题：「最后一次成功扫描发生在启动后几秒」「一共扫了几轮」「每轮各挂到几处」
+static volatile int   gInstalling   = 0;   // 简易自旋锁：同一时刻只允许一个安装者在跑
+static int            gTryCount     = 0;   // 扫描轮次
+static double         gFirstTryOffset = -1;// 第一轮扫描发生的时刻（★ 这一个数就能说明"排得早≠跑得早"）
+static double         gLastTryOffset  = -1;// 最后一轮扫描的时刻
+static NSMutableArray *gTimeline    = nil; // 每轮："第N轮 @X.XXs → 命中K"
+
+// ★★ v1.0.3：UIRefreshControl 低频轮询（只读观测）
+//    要回答的问题：「那个圈圈到底是不是 UIRefreshControl 在转」
+//    因为 UIRefreshControl 若由 scrollView 内部驱动，是【不经过】-beginRefreshing 的
+//    （beginRefreshing 是给外部代码程序化调用用的），所以我们改从结果侧观测。
+static int      gPollTicks      = 0;    // 已经轮询了几次
+static int      gPollScrollSeen = 0;    // 见过的 UIScrollView 数量（用来证明确实在扫）
+static int      gPollHits       = 0;    // 见到 refreshControl.isRefreshing == YES 的次数
+static double   gPollFirst      = -1;   // 首次见到刷新的时刻
+static NSString *gPollPage      = nil;  // 首次见到刷新时，那个 scrollView 所在的页面
+
+// ★★ v1.0.3 追加的第二路观测（同样是纯只读）：**列表是不是被「程序性地」拉下去了**。
+//    背景：v1.0.2 真机数据里 beginRefreshing / endRefreshing / setState: 全都是 0 ——
+//    说明那一次刷新【一个挂钩都没惊动】。这可能意味着：
+//      (a) 我们挂晚了（时间问题）；或
+//      (b) 它是 Swift 内部调用（Swift 对 @objc 但非 dynamic 的方法走 vtable/直接调用，
+//          **根本不经过 objc_msgSend，也就永远绕过 method_setImplementation**）；或
+//      (c) 它压根不是刷新控件，只是列表被重置了。
+//    要区分这三者，最省事的办法是**不靠任何挂钩**，直接看几何量：
+//      列表静止在顶部时  contentOffset.y == -adjustedContentInset.top
+//      下拉露出圈圈时    contentOffset.y 会更小（更负），即  (-y) - inset.top > 0
+//    再加上「没人在拖 / 没在惯性滑动」这个条件 → 就是**程序性下拉**，也就是我们要抓的那一下。
+//    ★ 这仍然是"只读"：只读 contentOffset 和 inset，一个几何值都不写（铁律 3 不禁止读，只禁止写）。
+//    ★ 而且它给出的正是我们最缺的那个数：**那一下到底发生在启动后第几秒**。
+static int      gPollPullHits  = 0;     // 见到"程序性下拉"的次数
+static double   gPollPullFirst = -1;    // 首次见到的时刻 ★ 关键数据
+static double   gPollPullMax   = 0;     // 下拉得最深的一次（点）
+static NSString *gPollPullPage = nil;   // 首次见到时所在的页面
 
 static NSTimeInterval gStartTime     = 0;
 static NSTimeInterval gLastAllow     = 0;
@@ -173,6 +262,8 @@ static NSTimeInterval  gEvLast[XNREvKindCount];
 
 static BOOL XNRPresentStats(void);      // 前置声明（定义在后面）
 static void XNRStatsRetry(int tries);   // 前置声明
+// ★ v1.0.3：定义在安装段，但扫描循环里要用 —— 它负责"这个类是不是第一次见到"
+static BOOL XNRSeenAndAdd(Class c);     // 前置声明
 
 #pragma mark - 刷新控件判定（★ 只有 XNRIsFooter 允许在后台线程调用）
 
@@ -260,10 +351,23 @@ static XNRPatch gPatches[XNR_MAX_PATCHES];
 static int      gPatchCount = 0;
 static int      gPatchSkipped = 0;   // 因表满被跳过的次数
 
+// ★★ v1.0.3 并发安全（这是 v1.0.3 引入后台安装后【必须】补上的一处）：
+//   v1.0.2 里安装只在主线程跑、钩子也基本在主线程触发，所以查表是"单线程"的、不用管。
+//   v1.0.3 安装跑在后台线程了 —— 于是会出现：后台正在往 gPatches 里写第 N 条，
+//   而主线程上某个钩子已经在遍历这张表。若此时 gPatchCount 已经先涨了，
+//   读到的就是一条【字段没写完】的垃圾记录 → 回查出一个野 IMP → **崩溃**。
+//
+//   解法是标准的"先写数据、再用屏障发布 count"：
+//     写端：写完 cls/sel/imp → __sync_synchronize() → 才把 count 加 1
+//     读端：先一把屏障把 count 的读取"锚住"，再遍历 0..count-1
+//   这样读到 count=N 时，第 0..N-1 条一定已经完整可见。
+//   （安装者本身被自旋锁限制成"同一时刻只有一个"，所以是单生产者模型。）
 static IMP XNROrigFor(id self, SEL sel) {
+    __sync_synchronize();                          // ★ 获取屏障：拿 count 之前先把内存视图同步好
+    int cnt = gPatchCount;                         // 只读一次，避免遍历途中 count 变化
     Class c = object_getClass(self);
     for (Class k = c; k != Nil; k = class_getSuperclass(k)) {
-        for (int i = 0; i < gPatchCount; i++) {
+        for (int i = 0; i < cnt; i++) {
             if (gPatches[i].cls == k && sel_isEqual(gPatches[i].sel, sel)) return gPatches[i].imp;
         }
     }
@@ -291,40 +395,92 @@ static BOOL XNRIsPatched(Class c, SEL sel) {
     return NO;
 }
 
-static BOOL XNRPatchMethod(Class c, SEL sel, IMP repl, XNRSigKind kind, const char **why) {
-    if (!c || !sel || !repl) { if (why) *why = "空参数"; return NO; }
-    if (XNRIsPatched(c, sel)) { if (why) *why = "已挂过"; return NO; }
-    if (gPatchCount >= XNR_MAX_PATCHES) { gPatchSkipped++; if (why) *why = "表满"; return NO; }
+// ★★ v1.0.3：这里原来写的是【中文】的 const char *（"空参数" / "已挂过" / "继承来的(避碰父类)"…），
+//    而它在日志与弹窗里是用 `%s` 输出的 —— 和 XNRAllEvents 那个"花屏"是**同一个坑**
+//    （`%s` 在 NSString 格式化里按平台默认 C 编码解释，不是 UTF-8）。
+//    这类 bug 由 check_tweak.py 第 13 条静态拦下，然后逐个改成「内部用 ASCII 标识符 + 显示时翻译」：
+//      · 内部：ASCII，便于 strcmp 比较，且交给 %s 也绝不会花屏；
+//      · 显示：由 XNRWhyText() 翻成中文 @"..."，走 %@ 输出。
+#define XNRW_EMPTY   "empty-arg"      // 参数为空
+#define XNRW_PATCHED "already"        // 已经挂过了
+#define XNRW_FULL    "table-full"     // 挂钩表满
+#define XNRW_INHERIT "inherited"      // 继承来的（避碰父类）
+#define XNRW_NOMETH  "no-method"      // 方法不存在
+#define XNRW_BADSIG  "bad-sig"        // 签名不匹配
+#define XNRW_SETFAIL "impl-failed"    // 换实现失败
 
-    if (!XNRClassDefines(c, sel)) { if (why) *why = "继承来的(避碰父类)"; return NO; }
+// 把 ASCII 的跳过原因翻成给人看的中文（ASCII 原因不用翻译，原样返回）
+static NSString *XNRWhyText(const char *w) {
+    if (!w) return @"(无)";
+    if (!strcmp(w, XNRW_EMPTY))   return @"空参数";
+    if (!strcmp(w, XNRW_PATCHED)) return @"已挂过";
+    if (!strcmp(w, XNRW_FULL))    return @"挂钩表满";
+    if (!strcmp(w, XNRW_INHERIT)) return @"继承来的(避碰父类)";
+    if (!strcmp(w, XNRW_NOMETH))  return @"方法不存在";
+    if (!strcmp(w, XNRW_BADSIG))  return @"签名不匹配";
+    if (!strcmp(w, XNRW_SETFAIL)) return @"换实现失败";
+    return [NSString stringWithUTF8String:w] ?: @"(未知原因)";   // 例如"类型签名"这种自由文本
+}
+
+static BOOL XNRPatchMethod(Class c, SEL sel, IMP repl, XNRSigKind kind, const char **why) {
+    if (!c || !sel || !repl) { if (why) *why = XNRW_EMPTY; return NO; }
+    if (XNRIsPatched(c, sel)) { if (why) *why = XNRW_PATCHED; return NO; }
+    if (gPatchCount >= XNR_MAX_PATCHES) { gPatchSkipped++; if (why) *why = XNRW_FULL; return NO; }
+
+    if (!XNRClassDefines(c, sel)) { if (why) *why = XNRW_INHERIT; return NO; }
 
     Method m = class_getInstanceMethod(c, sel);
-    if (!m) { if (why) *why = "方法不存在"; return NO; }
+    if (!m) { if (why) *why = XNRW_NOMETH; return NO; }
     const char *t = method_getTypeEncoding(m);
-    if (!XNRSigCheck(kind, t)) { if (why) *why = t ? t : "无签名"; return NO; }
+    if (!XNRSigCheck(kind, t)) { if (why) *why = t ? t : XNRW_BADSIG; return NO; }
 
     IMP old = method_setImplementation(m, repl);
-    if (!old || old == repl) { if (why) *why = "换实现失败"; return NO; }
+    if (!old || old == repl) { if (why) *why = XNRW_SETFAIL; return NO; }
 
-    gPatches[gPatchCount].cls = c;
-    gPatches[gPatchCount].sel = sel;
-    gPatches[gPatchCount].imp = old;
-    gPatchCount++;
+    // ★★ 发布顺序（配合 XNROrigFor 里的获取屏障）：
+    //    先把整条记录写完，再同步内存，最后才让 gPatchCount 涨 —— 顺序绝不能反。
+    //    反过来写的话，主线程上的钩子可能读到"count 已涨、字段还没写完"的垃圾条目。
+    int idx = gPatchCount;
+    gPatches[idx].cls = c;
+    gPatches[idx].sel = sel;
+    gPatches[idx].imp = old;
+    __sync_synchronize();          // ★ 释放屏障
+    gPatchCount = idx + 1;         // ★ 发布
     return YES;
 }
 
 #pragma mark - 取证：记下「哪个页面、被放行还是被拦」
 
+// ★ v1.0.3：取证加锁。
+//   gEvLines[kind] 是 NSMutableArray —— 【不是线程安全】的。
+//   而 -reloadData 这种钩子在真实 App 里是可能从后台线程触发的，
+//   两个线程同时 addObject / 同时懒初始化，就可能直接崩在里面。
+//   节流与计数也一并放进锁里，避免两个线程同时通过节流检查。
+static NSLock *XNREventLock(void) {
+    static NSLock *l = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ l = [[NSLock alloc] init]; });
+    return l;
+}
+
 // page 由调用方传入（主线程里取好），本函数自身不碰 UIKit
 // kind：按事件类型分开记账，各自 1.5 秒节流、各自留 3 条 —— 防止某一类事件把额度占满
+//
+// ★ 锁必须配 @finally 释放：本函数里有好几处 `return`，
+//   而 ObjC 的 return / 异常都【不会】执行 @try 之后的普通语句 —— 只有 @finally 保证一定跑到。
+//   （写成 "@try{} @catch{} [lk unlock];" 的话，一旦走到 return，锁就永远不释放 → 整机卡死。
+//     这类"提前 return 漏解锁"是加锁时最容易犯、也最难查的错。）
 static void XNRRecordEventKind(NSString *what, NSString *page, BOOL blocked, XNREvKind kind) {
     if (!kProbeTrigger) return;
     if (kind < 0 || kind >= XNREvKindCount) return;
-    NSTimeInterval now = XNRNow();
-    if (now - gEvLast[kind] < 1.5) return;   // 节流：同类事件最多每 1.5 秒记一条
-    gEvLast[kind] = now;
 
+    NSLock *lk = XNREventLock();
+    [lk lock];
     @try {
+        NSTimeInterval now = XNRNow();
+        if (now - gEvLast[kind] < 1.5) return;   // 节流：同类事件最多每 1.5 秒记一条
+        gEvLast[kind] = now;
+
         if (!gEvLines[kind]) gEvLines[kind] = [NSMutableArray array];
         if (gEvLines[kind].count >= XNR_EV_PER_KIND) return;
 
@@ -341,6 +497,7 @@ static void XNRRecordEventKind(NSString *what, NSString *page, BOOL blocked, XNR
         [gEvLines[kind] addObject:line];
         XNRLogLine(@"🔎 %@", line);
     } @catch (NSException *e) { (void)e; }
+    @finally { [lk unlock]; }                     // ★ 无论 return 还是抛异常，都会执行到
 }
 
 // 兼容旧调用点（拦截/放行都属于「beginRefreshing」这一类）
@@ -349,12 +506,28 @@ static void XNRRecordEvent(NSString *what, NSString *page, BOOL blocked) {
 }
 
 // 把所有类型的事件拼成一段给弹窗看
+//
+// ★★ v1.0.3 修掉一个真机上才看得见的显示 bug（"中文花屏"）：
+//    v1.0.2 这里写的是
+//        static const char *names[] = { "刷新事件", "列表重载", ... };   // 文件作用域，不能写 @"..."
+//        [NSString stringWithFormat:@"— %s —", names[k]];
+//    真机弹窗上那行字变成了 `— ÂåöÈ•ÉàçÊÖÑ —`。
+//    ****根因：`%s` 在 NSString 的格式化里【不是按 UTF-8 解释】，而是按"平台默认 C 字符串编码"
+//    （Apple 平台上是 MacRoman）**** —— 把一个 UTF-8 的中文串交给 %s，必然花屏。
+//    （ASCII 的 %s 没问题，所以类名/SEL 那些用 %s 一直是好的，只有中文暴露了这个坑。）
+//
+//    这类 bug 最阴的地方：**本地和 CI 都发现不了**（编译没问题、自检也没管），
+//    只有真机弹窗上才会看见。→ 已在 check_tweak.py 加了第 13 条：
+//    **C 字符串字面量里不许出现非 ASCII 字符**，面向用户的文案一律写 `@"..."`。
+//    这里的修法就是最直接的：改成**函数内局部**的 NSString 数组（函数内不能写文件作用域 static
+//    的那种初始化，但普通局部变量是运行时构造的，完全合法）。
 static NSString *XNRAllEvents(void) {
     NSMutableArray *all = [NSMutableArray array];
-    static const char *names[XNREvKindCount] = { "刷新事件", "列表重载", "刷新结束", "状态被写" };
+    NSArray<NSString *> *names = @[@"刷新事件", @"列表重载", @"刷新结束", @"状态被写"];
     for (int k = 0; k < XNREvKindCount; k++) {
         if (!gEvLines[k] || !gEvLines[k].count) continue;
-        [all addObject:[NSString stringWithFormat:@"— %s —\n%@", names[k],
+        NSString *title = (k < (int)names.count) ? names[k] : [NSString stringWithFormat:@"类型%d", k];
+        [all addObject:[NSString stringWithFormat:@"— %@ —\n%@", title,
                         [gEvLines[k] componentsJoinedByString:@"\n\n"]]];
     }
     return all.count ? [all componentsJoinedByString:@"\n\n"] : @"";
@@ -560,23 +733,31 @@ static void XNRHookedSetState(id self, SEL _cmd, NSInteger st) {
 //       类名含 "Refresh"  或  该类自己实现了 -beginRefreshing
 //     —— 单靠类名会漏掉名字奇怪的实现；单靠 beginRefreshing 会漏掉不实现它的自研控件。
 //        两条并集，两边都不漏。
-// ★ label 是 const char *（不是 NSString *）：这个数组是【静态存储期】的初始化器，
-//   ObjC 的 @"..." 字面量在静态初始化里既不是编译期常量、类型也对不上，
+// ★ 这个数组是【静态存储期】的初始化器，所以字段里只能写 C 字符串字面量：
+//   ObjC 的 @"..." 在静态初始化里既不是编译期常量、类型也对不上，
 //   clang 会直接以 -Werror,-Wincompatible-pointer-types 报错（v1.0.2 首轮 CI 就栽在这）。
 //   → 静态初始化器里只允许 C 字符串字面量。
+//
+// ★ v1.0.3 删掉了原来的 `label`（const char *）字段：它是一段中文说明，但**从头到尾没被用过**，
+//   而且留着一串中文 C 字符串迟早会被 `%s` 输出成花屏（见 XNRAllEvents 上面那段）。
+//   现在每个挂钩的中文说明挪到下面这行注释里 —— 注释不会进二进制，零风险。
 typedef struct {
     const char     *selName;
     IMP             repl;
     XNRSigKind      sig;
     BOOL            refreshControlOnly;
-    const char     *label;
 } XNRGateDef;
 
+// 各挂钩的用途（对应下标 0~3）：
+//   beginRefreshing  拦截 + 计数   ← 本插件唯一会"吃"的行为
+//   endRefreshing    只读探针：刷新结束（只要刷过一定会调用它）
+//   setState:        只读探针：刷新状态被写（MJRefresh 的圈圈走这里进 Refreshing）
+//   reloadData       只读探针：列表重载（定位"那一刻"与调用来源）
 static const XNRGateDef gGateDefs[] = {
-    { "beginRefreshing",  (IMP)&XNRHookedBeginRefreshing, XNRSigVoidNoArg,  NO,  "拦截+计数" },
-    { "endRefreshing",    (IMP)&XNRHookedEndRefreshing,   XNRSigVoidNoArg,  YES, "探针:刷新结束" },
-    { "setState:",        (IMP)&XNRHookedSetState,        XNRSigVoidIntArg, YES, "探针:状态被写" },
-    { "reloadData",       (IMP)&XNRHookedReloadData,      XNRSigVoidNoArg,  NO,  "探针:列表重载" },
+    { "beginRefreshing",  (IMP)&XNRHookedBeginRefreshing, XNRSigVoidNoArg,  NO  },
+    { "endRefreshing",    (IMP)&XNRHookedEndRefreshing,   XNRSigVoidNoArg,  YES },
+    { "setState:",        (IMP)&XNRHookedSetState,        XNRSigVoidIntArg, YES },
+    { "reloadData",       (IMP)&XNRHookedReloadData,      XNRSigVoidNoArg,  NO  },
 };
 #define XNR_GATE_COUNT (sizeof(gGateDefs) / sizeof(gGateDefs[0]))
 
@@ -590,13 +771,17 @@ static BOOL XNRIsRefreshControl(Class c) {
     return XNRClassDefines(c, @selector(beginRefreshing));
 }
 
+// ★★ v1.0.3：本函数【刻意做成可反复调用】的（幂等）——
+//    每轮只挂"还没挂过的"（靠 XNRIsPatched 去重），所以可以持续重扫，
+//    把**晚加载的框架**（XYSpark、React Native 控件）也收进来。
+//    v1.0.2 里开头有 `if (gInstalled) return gHooked;`，第一轮成功后就再也不扫了 ——
+//    那是个真 bug：先挂上 UIRefreshControl 就等于把后面才出现的刷新头判了死刑。
 static int XNRInstallGates(void) {
-    if (gInstalled) return gHooked;
-
-    NSMutableArray *names = [NSMutableArray array];   // beginRefreshing 命中的类（弹窗里展示）
+    if (!gHookedNames) gHookedNames = [NSMutableArray array];
+    NSMutableArray *names = gHookedNames;             // ★ 直接往持久数组里追加（跨轮累积）
     NSMutableArray *notes = [NSMutableArray array];
-    NSMutableArray *perGate = [NSMutableArray array]; // 每个探针挂了多少个
-    int n = 0;
+    NSMutableArray *perGate = [NSMutableArray array]; // 每个挂钩各挂上了多少个（从全局表统计，天然准确）
+    int n = 0;                                        // 本轮【新】挂上的 beginRefreshing 数
 
     // ★★ 命中规则（框架无关）：只要某个类【自己实现】了目标方法且签名完全匹配，就挂它。
     //    B站 那版靠「类名里有没有 Refresh」猜；小红书实测用的是 MJRefresh + 自研 Swift 头 + RN 控件，
@@ -609,6 +794,11 @@ static int XNRInstallGates(void) {
             if (!c) continue;
             const char *nm = class_getName(c);
             if (!nm) continue;
+
+            // ★ v1.0.3：跳过之前几轮已经处理过的类。
+            //   这是让"持续重扫"可行且不拖慢 App 的关键 —— 否则每轮都要对全部三万多类
+            //   × 4 个挂钩沿继承链找方法，一轮就是几百毫秒。有了它，重扫的代价只剩"新出现的类"。
+            if (!XNRSeenAndAdd(c)) continue;
 
             BOOL isRefreshFamily = XNRIsRefreshControl(c);
 
@@ -629,9 +819,16 @@ static int XNRInstallGates(void) {
                 const char *w = NULL;
                 if (XNRPatchMethod(c, sel, d->repl, d->sig, &w)) {
                     gHooked++;
-                    if (strcmp(d->selName, "beginRefreshing") == 0) { n++; [names addObject:[NSString stringWithUTF8String:nm]]; }
-                } else if (w && strcmp(w, "继承来的(避碰父类)") && strcmp(w, "方法不存在") && strcmp(w, "已挂过")) {
-                    [notes addObject:[NSString stringWithFormat:@"%s.%s 跳过(%s)", nm, d->selName, w]];
+                    if (strcmp(d->selName, "beginRefreshing") == 0) {
+                        n++;
+                        // ★ v1.0.3：安装现在跑在【后台线程】，而弹窗在主线程读这个数组。
+                        //   NSMutableArray 被一边追加一边遍历 = 直接崩。加一把对象锁兜住。
+                        //   （v1.0.2 安装全程在主队列，不存在这个竞争，所以以前不需要。）
+                        @synchronized(names) { [names addObject:[NSString stringWithUTF8String:nm]]; }
+                    }
+                } else if (w && strcmp(w, XNRW_INHERIT) && strcmp(w, XNRW_NOMETH) && strcmp(w, XNRW_PATCHED)) {
+                    // ★ 原因经 XNRWhyText() 翻成中文、走 %@（不能用 %s，会花屏）
+                    [notes addObject:[NSString stringWithFormat:@"%s.%s 跳过(%@)", nm, d->selName, XNRWhyText(w)]];
                 }
             }
         }
@@ -646,17 +843,23 @@ static int XNRInstallGates(void) {
         [perGate addObject:[NSString stringWithFormat:@"%s=%d", gGateDefs[g].selName, cnt]];
     }
 
-    gHookedNames = names;
     gPerGateInfo = perGate.count ? [perGate componentsJoinedByString:@" "] : @"";
-    if (gPatchCount > 0) gInstalled = YES;      // ★ 有任何一个挂上了就算装好；否则等下一轮重试
+    // ★★ v1.0.3 修正一处语义错误：v1.0.2 里 gInstallOffset 是【每轮都尝试赋值】，
+    //    所以它记的其实是"第一轮失败扫描的时刻"，而不是"真正挂上钩子的时刻" ——
+    //    弹窗上那个 4.2 秒因此是有歧义的。现在只在真的挂上东西时才记。
+    if (gPatchCount > 0 && !gInstalled) {
+        gInstalled = YES;
+        if (gInstallOffset < 0) gInstallOffset = XNRNow() - gStartTime;
+    }
     if (gStartTime <= 0) gStartTime = XNRNow();
-    if (gInstallOffset < 0) gInstallOffset = XNRNow() - gStartTime;
 
-    XNRLogLine(@"=== v%s 安装（第 %d 轮，启动后 %.1fs）：共 %d 处  %@",
-               kVersion, gInstallTries, XNRNow() - gStartTime, gPatchCount,
+    XNRLogLine(@"=== v%s 安装（第 %d 轮，启动后 %.2fs）：本轮新增 %d 处，累计 %d 处  %@",
+               kVersion, gInstallTries, XNRNow() - gStartTime, n, gPatchCount,
                perGate.count ? [perGate componentsJoinedByString:@" "] : @"");
-    XNRLogLine(@"     beginRefreshing 命中类(%d): %@", n,
-               names.count ? [names componentsJoinedByString:@", "] : @"(无)");
+    if (n > 0) {   // 只在真有新增时才打这一行（重扫会很频繁，避免刷屏）
+        XNRLogLine(@"     本轮新增 beginRefreshing 类(%d): %@", n,
+                   names.count ? [names componentsJoinedByString:@", "] : @"(无)");
+    }
     if (notes.count) XNRLogLine(@"     跳过: %@", [notes componentsJoinedByString:@"; "]);
     if (gPatchSkipped) XNRLogLine(@"     ⚠️ 有 %d 处因挂钩表满被跳过", gPatchSkipped);
 
@@ -719,15 +922,26 @@ static BOOL XNRPresentStats(void) {
     if (!XNRCanPresent()) return NO;                 // 不在稳定态 → 稍后重试
 
     @try {
-        NSString *cls   = gHookedNames.count ? [gHookedNames componentsJoinedByString:@"\n"] : @"(没找到任何 -beginRefreshing 实现)";
+        // ★ v1.0.3：这里的快照必须在锁里取 —— 后台安装线程可能正在往 gHookedNames 追加，
+        //   而 -componentsJoinedByString: 会遍历它（边追加边遍历 = 崩）。
+        NSString *cls = nil;
+        int clsCnt = 0;
+        @synchronized(gHookedNames) {
+            if (!gHookedNames) gHookedNames = [NSMutableArray array];
+            clsCnt = (int)gHookedNames.count;
+            cls = gHookedNames.count
+                ? [gHookedNames componentsJoinedByString:@"\n"]
+                : @"(没找到任何 -beginRefreshing 实现)";
+        }
         NSString *hints = XNRAllEvents();
         if (!hints.length) hints = @"(还没捕捉到 —— 从装上到现在什么事件都没记到)";
+        // 注意：外层已经写了「启动宽限」四个字，这里不要再重复（v1.0.2 的弹窗里重复了两次）
         NSString *valve = kStartupGrace
-            ? [NSString stringWithFormat:@"启动宽限剩 %.1fs%@%@",
+            ? [NSString stringWithFormat:@"开，剩 %.1fs%@%@",
                MAX(0.0, kStartupGraceSecs - (XNRNow() - gStartTime)),
                (gCooldownUntil > XNRNow()) ? @"·熔断中" : @"",
                gCooldownHit ? [NSString stringWithFormat:@"·熔断过 %d 次", gCooldownHit] : @""]
-            : [NSString stringWithFormat:@"启动宽限: 关（空列表放行 %@）%@",
+            : [NSString stringWithFormat:@"关（空列表放行 %@）%@",
                kSkipWhenEmptyView ? @"开" : @"关",
                gCooldownHit ? [NSString stringWithFormat:@"·熔断过 %d 次", gCooldownHit] : @""];
 
@@ -748,11 +962,27 @@ static BOOL XNRPresentStats(void) {
             ? [NSString stringWithFormat:@"%.0f 秒前", XNRNow() - gLastAllow]
             : @"(还没有)";
 
+        // ★ v1.0.3：安装时间线 + 轮询观测
+        NSString *instStr  = (gInstallOffset < 0) ? @"(还没装上)" : [NSString stringWithFormat:@"启动后 %.2f 秒", gInstallOffset];
+        NSString *firstTry = (gFirstTryOffset < 0) ? @"(还没扫过)" : [NSString stringWithFormat:@"启动后 %.2f 秒", gFirstTryOffset];
+        NSString *lastTry  = (gLastTryOffset < 0) ? @"(还没扫过)" : [NSString stringWithFormat:@"启动后 %.2f 秒", gLastTryOffset];
+        // ★ 同上：时间线也要在锁里取快照（后台安装线程可能正在追加）
+        NSString *timeline = nil;
+        @synchronized(gTimeline) {
+            if (!gTimeline) gTimeline = [NSMutableArray array];
+            timeline = gTimeline.count ? [gTimeline componentsJoinedByString:@"  "] : @"(还没有)";
+        }
+        NSString *maxState = (gProbeSetMaxState < 0) ? @"没写过" : [NSString stringWithFormat:@"%d", gProbeSetMaxState];
+        NSString *pollPage = gPollPage ?: @"(还没见到)";
+
         NSString *msg = [NSString stringWithFormat:
             @"本进程包名\n%@\n\n"
              "闸门安装于         %@\n"
+             "首轮扫描于         %@\n"
+             "扫描轮次           %d 轮   最后一轮 %@\n"
              "各挂钩命中          %@\n"
-             "挂钩类数: %d    %@\n\n"
+             "挂钩落脚点         %d 处（其中 beginRefreshing 覆盖 %d 个类）\n"
+             "启动宽限           %@\n\n"
              "beginRefreshing  触发 %d / 放行 %d / 吃掉 %d\n"
              "触发来源          主线程 %d / 后台线程 %d\n"
              "首次触发          %@\n"
@@ -762,6 +992,13 @@ static BOOL XNRPresentStats(void) {
              "  endRefreshing       %d 次   首次 %@\n"
              "  setState: 总写入     %d 次   (最大 state = %@)\n"
              "  └ 写入 Refreshing(3) %d 次   首次 %@\n\n"
+             "★ 轮询观测（只读：不靠任何挂钩，直接看界面结果）\n"
+             "  轮询 %d 次   见过 scrollView %d 个\n"
+             "  ① refreshControl 正在转   %d 次   首次 %@\n"
+             "     首次所在页面            %@\n"
+             "  ② 列表被程序性拉下         %d 次   首次 %@\n"
+             "     最深拉下                %.0f pt\n"
+             "     首次所在页面            %@\n\n"
              "放行原因明细（判断插件是否按预期工作的关键）\n"
              "  列表还没内容(首屏加载)  %d\n"
              "  用户自己在拖            %d\n"
@@ -769,32 +1006,43 @@ static BOOL XNRPresentStats(void) {
              "  上拉加载更多            %d\n"
              "  熔断静默期             %d\n"
              "  拿不到判断依据(放行)     %d\n\n"
+             "安装时间线（#轮次@时刻→本轮新增）:\n%@\n\n"
              "挂钩的类:\n%@\n\n"
              "抓到的事件（含调用栈，每类最多 3 条）:\n%@",
             bidLn,
-            (gInstallOffset < 0) ? @"(还没装上)" : [NSString stringWithFormat:@"启动后 %.1f 秒", gInstallOffset],
+            instStr, firstTry, gTryCount, lastTry,
             gPerGateInfo.length ? gPerGateInfo : @"(无)",
-            gHooked, valve,
+            gHooked, clsCnt, valve,
             gSeenBegin, gAllowBegin, gBlockedBeg,
             gSeenMain, gSeenBG,
             first, lastAllow,
             gProbeReload, XNRFmtOff(gProbeReloadFirst),
             gProbeEndRefresh, XNRFmtOff(gProbeEndFirst),
-            gProbeSetState, (gProbeSetMaxState < 0) ? @"没写过" : [NSString stringWithFormat:@"%d", gProbeSetMaxState],
+            gProbeSetState, maxState,
             gProbeSetRefresh, XNRFmtOff(gProbeSetFirst),
+            gPollTicks, gPollScrollSeen,
+            gPollHits, XNRFmtOff(gPollFirst),
+            pollPage,
+            gPollPullHits, XNRFmtOff(gPollPullFirst),
+            gPollPullMax,
+            gPollPullPage ?: @"(还没见到)",
             gAllowEmpty, gAllowUser, gAllowGrace, gAllowFooter, gAllowCool, gAllowNoInfo,
-            cls, hints];
+            timeline, cls, hints];
 
         BOOL ok = XNRAlert([NSString stringWithFormat:@"XhsNoRefresh v%s 统计", kVersion], msg, @"好");
         if (ok) {
-            XNRLogLine(@"--- 前台统计：包名=%@ 装于%.1fs 钩=%d 见=%d(主%d/后%d) 放行=%d 吃掉=%d 首次@%.1fs",
-                       gRealBundleID, gInstallOffset, gHooked, gSeenBegin, gSeenMain, gSeenBG,
-                       gAllowBegin, gBlockedBeg, gFirstSeenOffset);
+            XNRLogLine(@"--- 前台统计：包名=%@ 装于%.2fs 首扫%.2fs 轮次=%d 钩=%d 见=%d(主%d/后%d) 放行=%d 吃掉=%d",
+                       gRealBundleID, gInstallOffset, gFirstTryOffset, gTryCount, gHooked,
+                       gSeenBegin, gSeenMain, gSeenBG, gAllowBegin, gBlockedBeg);
             XNRLogLine(@"--- 探针：reloadData=%d(首%.1fs) endRefreshing=%d(首%.1fs) setState=%d(最大%d) 其中Refreshing=%d(首%.1fs)",
                        gProbeReload, gProbeReloadFirst,
                        gProbeEndRefresh, gProbeEndFirst,
                        gProbeSetState, gProbeSetMaxState,
                        gProbeSetRefresh, gProbeSetFirst);
+            XNRLogLine(@"--- 轮询：%d 次 / 见过scrollView %d / ①正在刷新 %d 次（首次 %.2fs 于 %@）",
+                       gPollTicks, gPollScrollSeen, gPollHits, gPollFirst, gPollPage ?: @"-");
+            XNRLogLine(@"--- 轮询：②程序性拉下 %d 次（首次 %.2fs 于 %@，最深 %.0fpt）",
+                       gPollPullHits, gPollPullFirst, gPollPullPage ?: @"-", gPollPullMax);
         }
         return ok;
     } @catch (NSException *e) { (void)e; return NO; }
@@ -826,6 +1074,57 @@ static void XNRStatsRetry(int tries) {
 //    「Dylib 没加载 / 包名不匹配 / 扫描没找到刷新类」这三种完全不同的原因。
 //    教训：**给用户看的诊断输出，绝不能挂在「目标判定是否通过」下面。**
 //    现在：无论包名是什么都往下走，包名只用于日志与弹窗展示；是否真动手由「扫不扫得到刷新类」决定。
+// ★★ v1.0.3：把「扫描安装」包装成一个带【自旋锁 + 时间线】的轮次。
+//
+//   自旋锁是必需的：安装现在有【后台早期】和【主队列兜底】两条路径，
+//   两边同时扫的话，同一个 (类, 方法) 可能被两个线程同时换实现，
+//   而且 gPatchCount 递增与 gPatches 写入会互相踩（读到半更新的表 = 崩）。
+//   限制成"同一时刻只有一个安装者"，就回到了 v1.0.2 那种单线程写表的安全前提。
+static int XNRInstallAttempt(void) {
+    if (__sync_lock_test_and_set(&gInstalling, 1)) return 0;   // 有人在装 → 让给他
+    int n = 0;
+    @try {
+        double off = (gStartTime > 0) ? (XNRNow() - gStartTime) : 0.0;
+        gInstallTries = gTryCount + 1;
+        n = XNRInstallGates();
+        gTryCount++;
+        if (gFirstTryOffset < 0) gFirstTryOffset = off;
+        gLastTryOffset = off;
+        if (!gTimeline) gTimeline = [NSMutableArray array];
+        // ★ 与主线程弹窗的读取配对加锁（详见 XNRPresentStats 里取快照那段）
+        @synchronized(gTimeline) {
+            if (gTimeline.count < 40) {
+                [gTimeline addObject:[NSString stringWithFormat:@"#%d@%.2fs→%d处", gTryCount, off, n]];
+            }
+        }
+    } @catch (NSException *e) {
+        XNRLogLine(@"⚠️ 安装轮次抛异常：%@", e);
+    }
+    __sync_lock_release(&gInstalling);
+    return n;
+}
+
+// ★★ v1.0.3：已扫过的类放进哈希集合，重扫时直接跳过 —— 这是让"持续重扫"可行且不拖慢 App 的关键。
+//   不这么做的话，每轮都要对【全部三万多个类】× 4 个挂钩做 class_getInstanceMethod（要沿继承链找），
+//   一轮就是几百毫秒，几十轮下来会把 App 启动拖垮。
+//   有了它，重扫的代价只剩下"新出现的那些类"，未加载完的框架一出现就能立刻被挂上。
+#define XNR_SEEN_SIZE 65536u          // 512KB 静态表；三万多个类的装载率约 0.5，够用
+static Class gSeenClasses[XNR_SEEN_SIZE];
+
+static BOOL XNRSeenAndAdd(Class c) {  // 返回 YES = 这是第一次见到的类
+    if (!c) return NO;
+    uintptr_t h = ((uintptr_t)c >> 4) & (XNR_SEEN_SIZE - 1);
+    for (unsigned i = 0; i < 64; i++) {
+        unsigned idx = (unsigned)((h + i) & (XNR_SEEN_SIZE - 1));
+        Class cur = gSeenClasses[idx];
+        if (cur == c) return NO;
+        if (cur == NULL) { gSeenClasses[idx] = c; return YES; }
+    }
+    return YES;                        // 表满 → 保守当作新类，宁可多扫
+}
+
+// 主队列兜底路径：跟 v1.0.2 一样（但间隔固定 0.3 秒，不再递增）。
+// 现在它只是兜底 —— 正常情况下早期安装早就成功了。
 static void XNRInstallWhenReady(int tries) {
     @try {
         if (!gRealBundleID) {
@@ -836,24 +1135,121 @@ static void XNRInstallWhenReady(int tries) {
                        [gRealBundleID hasPrefix:tgt] ? @"是" : @"否（但这版不再因此中止，继续尝试安装）");
         }
 
-        gInstallTries = tries + 1;
-        int n = XNRInstallGates();              // 内部有 gInstalled 守卫，成功过就不会再扫
+        XNRInstallAttempt();
 
-        if (n > 0) return;                      // 挂上了，收工
+        if (gInstalled) return;                 // 挂上了，兜底路径收工
 
-        // 一个都没挂上 → 很可能 App 自己的库还没加载完 → 延后重试（间隔递增）
         if (tries + 1 >= XNR_MAX_TRIES) {
-            XNRLogLine(@"⚠️ 试了 %d 轮都没找到任何 -beginRefreshing 实现 —— 小红书可能不走这个入口，"
-                       @"需要换拦截点（看 XNR_fix.log 与弹窗）", XNR_MAX_TRIES);
+            XNRLogLine(@"⚠️ 兜底路径试了 %d 轮仍未挂上任何钩子"
+                       @"（早期安装那边还在继续扫，看 XNR_fix.log 的安装时间线）", XNR_MAX_TRIES);
             return;
         }
-        int64_t ns = (int64_t)(0.5 * (double)(tries + 1) * NSEC_PER_SEC);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, ns), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
             XNRInstallWhenReady(tries + 1);
         });
     } @catch (NSException *e) {
         XNRLogLine(@"⚠️ 安装过程抛异常：%@", e);
     }
+}
+
+// ★★★ v1.0.3 的核心机制：后台早期安装 + 持续重扫。
+//
+//   为什么必须离开主队列：v1.0.2 实测「闸门安装于 启动后 4.2 秒」，
+//   而用户的现象（打开就刷新）发生在启动后 1~2 秒 —— 钩子挂上时那一次早打完了。
+//   App 启动时主线程被 dyld 加载几十个框架 + 自己的启动任务占满，
+//   排在主队列上的任务要等它整段跑完才轮到。**排得早 ≠ 跑得早。**
+//
+//   为什么必须持续重扫：晚加载的框架（XYSpark、React Native 控件）在头几百毫秒里还不存在，
+//   只扫一轮的话永远挂不上它们。（v1.0.2 里"第一轮成功就 return"也是同一个 bug 的一种形态。）
+//
+//   为什么敢在后台线程动 ObjC 运行时：
+//     · 铁律 2 禁止的是【在 dyld 构造函数里立刻碰运行时】——这里是构造函数返回之后、
+//       在另一个线程上执行，且首轮刻意延迟 kEarlyFirstDelayMs 避开镜像加载最密集的时刻；
+//     · 整个过程【只碰运行时，绝不碰 UIKit】（不读视图、不弹窗、不碰主线程状态）；
+//     · 整段包在 @try 里，并被自旋锁串行化；
+//     · 留了一键回退开关 kEarlyInstall = NO（改一行就回到 v1.0.2 的主队列路径）。
+//   ★ 为什么用 dispatch_after 串起来、而不是 usleep 循环：
+//     GCD 全局并发队列的工作线程数是有限的（通常远小于我们想扫的轮数）。用 usleep 把
+//     线程按住 3 秒，等于从系统的线程池里"借走"一个线程不放 —— 轻则拖慢 App 自己的后台任务，
+//     重则让线程池饥饿。dispatch_after 是"排一个将来的时间点"，**排完立刻归还线程**，全程不占用。
+//     代价只是一点时间精度（毫秒级），而我们本来就只需要"在前 3 秒里多扫几十轮"。
+static void XNREarlyInstallStep(int round) {
+    if (!kEarlyInstall) return;
+
+    // 每轮只做一件事：扫一轮类表，挂上还没挂的钩子（幂等，可反复调用）
+    XNRInstallAttempt();
+
+    double elapsed = (gStartTime > 0) ? (XNRNow() - gStartTime) : 0.0;
+    if (elapsed >= kEarlyRescanSecs) {
+        XNRLogLine(@"--- 早期安装收工：共扫 %d 轮，累计 %d 处，最后一次在启动后 %.2fs",
+                   gTryCount, gPatchCount, gLastTryOffset);
+        return;
+    }
+
+    // ★ 注意：这里的 block 捕获 round（值捕获），递归改成了"排下一轮"，不再占用当前线程
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(kEarlyIntervalMs * NSEC_PER_MSEC)),
+                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        @autoreleasepool { XNREarlyInstallStep(round + 1); }
+    });
+}
+
+#pragma mark - ★ v1.0.3 只读观测：UIRefreshControl 轮询
+
+// 为什么要从"结果侧"观测：UIRefreshControl 如果是由 scrollView 内部驱动进入刷新态的，
+// 它【不经过】-beginRefreshing（那个方法是给外部代码程序化调用用的）。
+// 所以我们直接读 scrollView.refreshControl.isRefreshing —— 只读属性，不改任何东西。
+static void XNRPollScan(UIView *v) {
+    if (!v) return;
+    @try {
+        if ([v isKindOfClass:[UIScrollView class]]) {
+            UIScrollView *sv = (UIScrollView *)v;
+            gPollScrollSeen++;
+            UIRefreshControl *rc = sv.refreshControl;
+            if (rc && rc.isRefreshing) {
+                gPollHits++;
+                if (gPollFirst < 0 && gStartTime > 0) {
+                    gPollFirst = XNRNow() - gStartTime;
+                    gPollPage  = XNRPageOfAny(v) ?: @"(未识别)";
+                    XNRLogLine(@"🔎 轮询发现 UIRefreshControl 正在刷新：启动后 %.2fs  页面: %@",
+                               gPollFirst, gPollPage ?: @"?");
+                }
+            }
+
+            // ★ v1.0.3：第二路观测 —— 列表被"程序性地"拉下去了吗？（纯只读，见上面变量处的说明）
+            //   条件：超出顶部 30pt 以上，且没有任何人在拖 / 没有惯性滑动
+            //   → 那就是 App 自己在把列表往下拉（露出刷新圈圈），正是我们要抓的那一下。
+            double over = (-(sv.contentOffset.y)) - sv.adjustedContentInset.top;
+            if (over > 30.0 && !sv.isDragging && !sv.isTracking && !sv.isDecelerating) {
+                gPollPullHits++;
+                if (over > gPollPullMax) gPollPullMax = over;
+                if (gPollPullFirst < 0 && gStartTime > 0) {
+                    gPollPullFirst = XNRNow() - gStartTime;
+                    gPollPullPage  = XNRPageOfAny(v) ?: @"(未识别)";
+                    XNRLogLine(@"🔎 轮询发现列表被程序性拉下 %.0fpt（没人在拖）：启动后 %.2fs  页面: %@",
+                               over, gPollPullFirst, gPollPullPage ?: @"?");
+                }
+            }
+        }
+        for (UIView *sub in v.subviews) XNRPollScan(sub);
+    } @catch (NSException *e) { (void)e; }
+}
+
+static void XNRPollTick(int tick) {
+    if (!kPollRefreshCtrl) return;
+    if (tick >= 70) return;                       // 约 21 秒后自动停，不做长期轮询
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        @try {
+            gPollTicks++;
+            for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+                if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+                for (UIWindow *w in ((UIWindowScene *)sc).windows) XNRPollScan(w);
+            }
+        } @catch (NSException *e) { (void)e; }
+        XNRPollTick(tick + 1);
+    });
 }
 
 __attribute__((constructor))
@@ -865,8 +1261,29 @@ static void XNRInit(void) {
         //    只要 Dylib 被加载了，弹窗就一定会弹，我们才能拿到数据。
         if (gStartTime <= 0) gStartTime = XNRNow();
 
+        // ★ v1.0.3：这两个容器在【单线程的构造函数里】就建好。
+        //    之后安装线程只往里追加、主线程只读快照，两边都不用再判 nil/竞态建表。
+        if (!gHookedNames) gHookedNames = [NSMutableArray array];
+        if (!gTimeline)    gTimeline    = [NSMutableArray array];
+
+        // ★★★ v1.0.3 主路径：后台队列立刻起步（不走主队列，因此不会被 App 启动堵住）
+        //    首轮刻意延迟 kEarlyFirstDelayMs，避开 dyld 加载镜像最密集的那一瞬间。
+        if (kEarlyInstall) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)(kEarlyFirstDelayMs * NSEC_PER_MSEC)),
+                           dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+                @autoreleasepool { XNREarlyInstallStep(0); }
+            });
+        }
+
+        // 兜底路径：主队列（可能要到 4 秒后才轮到，所以只当保险）
         dispatch_async(dispatch_get_main_queue(), ^{
             XNRInstallWhenReady(0);
+        });
+
+        // 只读观测：低频轮询 UIRefreshControl 的刷新状态
+        dispatch_async(dispatch_get_main_queue(), ^{
+            XNRPollTick(0);
         });
 
         // 切回前台时汇报一次统计（含稳定态检查）

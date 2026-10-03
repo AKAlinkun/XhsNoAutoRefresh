@@ -1,8 +1,8 @@
 Package: com.workbuddy.xhsnoautorefresh
 Name: XhsNoAutoRefresh
-Version: 1.0.2
+Version: 1.0.3
 Architecture: iphoneos-arm
-Description: 禁止小红书 iOS 客户端「一打开就自动刷新」，完整保留手动下拉刷新与上拉加载更多。v1.0.2 是「探针定位版」——起因是 v1.0.1 真机数据显示：7 个刷新控件全部挂钩成功（含 MJRefresh、XYSpark 自研 Swift 刷新头、React Native 控件），但 -beginRefreshing 一次都没被调用，也就是说这次自动刷新根本不走这个入口，光靠它拦不住。于是本版不改拦截逻辑，只加三个【只读探针】（-reloadData / -endRefreshing / -setState:），只数数、只记一条调用栈、一律原样转交原实现，用来抓出「到底是谁在驱动这次刷新」，并在弹窗里附带「闸门安装于启动后多少秒」以判断是否漏掉了启动瞬间的刷新。零 Logos 钩子、不依赖 CydiaSubstrate、全程不写任何几何值、不代调 App 的语义 API。
+Description: 禁止小红书 iOS 客户端「一打开就自动刷新」，完整保留手动下拉刷新与上拉加载更多。v1.0.3 是「早期安装版」——v1.0.2 真机弹窗给出了决定性数据：闸门装于「启动后 4.2 秒」，而用户看到的那次自动刷新发生在启动后 1~2 秒，也就是说钩子挂上时那一次早就打完了；这同时解释了为什么所有刷新探针都是 0——不是入口选错，是时间不对（排在主队列上的任务要等 App 启动那 4 秒整段跑完才轮到，排得早 ≠ 跑得早）。于是本版【只改安装时机这一个机制】：改为在后台队列尽早起步（首轮延迟 40ms 避开 dyld 加载最密的瞬间），并持续重扫到启动后 3 秒，收编头几百毫秒里还不存在的晚加载框架（XYSpark / React Native 控件）；为此引入「已扫过的类」哈希集合，让重扫的代价只剩新出现的类（否则每轮都要对三万多个类沿继承链找方法，反而拖垮启动）。另加两项只读观测：① 低频轮询 scrollView.refreshControl.isRefreshing，用来回答「那个圈圈到底是不是 UIRefreshControl 在转」（它若由 scrollView 内部驱动，是不经过 -beginRefreshing 的）；② 低频只读 contentOffset/adjustedContentInset，判断「列表是不是被程序性地拉下去了」——这一路完全不依赖任何挂钩，能直接给出那一次刷新的时间点和所在页面（为的是区分「没赶上时间」与「Swift 直接派发绕过了 objc_msgSend」这两种可能）。同时修掉两个只在真机上才看得见的显示问题：弹窗标题中文花屏（根因是 %s 在 NSString 格式化里按平台默认 C 编码 MacRoman 解释，不是 UTF-8，现已把该规则做成静态检查）与「挂钩类数」标签错标（原先把四个挂钩的方法总数当成了类数）。留了一键回退开关 kEarlyInstall。零 Logos 钩子、不依赖 CydiaSubstrate、全程不写任何几何值、不代调 App 的语义 API。
 Homepage: https://github.com/
 Maintainer: WorkBuddy
 Author: WorkBuddy
