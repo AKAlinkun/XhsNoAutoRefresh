@@ -123,6 +123,13 @@ def _selftest():
     mutant_ok("占位符类型不符（%d 吃到对象实参）",
               "            gProbeReload, XNRFmtOff(gProbeReloadFirst),",
               "            kVersion, XNRFmtOff(gProbeReloadFirst),")
+    # ★ v1.0.7：规则 8 的「关键函数清单」是一条**会腐烂的清单** ——
+    #   本轮把 XNRInstallGates 拆成四个函数时就踩到了：清单没同步 →
+    #   规则 8 立刻以"真定义出现 0 次"报警（这正是它该做的，但说明清单必须跟着改）。
+    #   这个用例保证它的**计数**仍然有效（造一处重复真定义）。
+    mutant_ok("关键函数出现两处真定义",
+              "static void XNRRefreshGateInfo(void) {",
+              "static void XNRRefreshGateInfo(void) {\n}\nstatic void XNRRefreshGateInfo(void) {")
     # 这一条是故意造括号不平衡，不做平衡校验
     cases.append(("括号不平衡", base + "\nstatic void broken(void) {\n"))
 
@@ -326,8 +333,14 @@ for op, cl in [("{", "}"), ("(", ")"), ("[", "]")]:
 # ── 8. 关键函数必须只有一处「真定义」 ──────────────────────────────────────
 # 起因：曾用脚本删重复函数时按 "\n}\n" 定位，误匹配到内层闭包，
 #       把函数截断成半截、反而制造出重复定义，而 clang 的报错完全指向别处。
-for fn in ["XNRPresentStats", "XNRStatsRetry", "XNRInstallGates", "XNRInstallWhenReady",
-           "XNRFmtOff", "XNRProbeNote", "XNRPageOfAny", "XNRIsRefreshControl",
+# ★ v1.0.7：清单随安装机制改名而更新 —— XNRInstallGates 拆成了
+#   XNRScanOneClass（单类处理）/ XNRInstallNarrow（窄快扫）/
+#   XNRInstallChunkStep（分片推进）/ XNRRefreshGateInfo（收尾统计）/ XNRNarrowRescanLoop（重扫循环）。
+#   ⚠️ 拆函数时**必须同步改这里**，否则这条规则会以"真定义出现 0 次"的形式报警（这正是它的作用）。
+for fn in ["XNRPresentStats", "XNRStatsRetry", "XNRInstallWhenReady",
+           "XNRScanOneClass", "XNRInstallNarrow", "XNRInstallChunkStep",
+           "XNRRefreshGateInfo", "XNRNarrowRescanLoop",
+           "XNRFmtOff", "XNRFmtTimes", "XNRProbeNote", "XNRPageOfAny", "XNRIsRefreshControl",
            "XNRRecordEventKind", "XNRAllEvents", "XNRRecordEvent",
            "XNRInstallAttempt", "XNREarlyInstallStep", "XNRPollScan", "XNRPollTick",
            "XNRSeenAndAdd"]:

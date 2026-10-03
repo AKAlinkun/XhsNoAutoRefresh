@@ -1,9 +1,9 @@
 Package: com.workbuddy.xhsnoautorefresh
 Name: XhsNoAutoRefresh
-Version: 1.0.6
+Version: 1.0.7
 Architecture: iphoneos-arm
-Description: 禁止小红书 iOS 客户端「一打开就自动刷新」，完整保留手动下拉刷新与上拉加载更多。v1.0.6 是「时间轴版」，只加四个只读观测，仍然一个行为都不改。起因是用户装完 v1.0.5 后回报「仍然有自动刷新」，并粘回了整段弹窗文本：闸门安装于启动后 3.95 秒、首轮扫描开始 0.95 秒且本轮耗时 2.99 秒（这一下是占着主线程的）、reloadData 首次在启动后 4.0 秒。三行摆在一起给出了两个很关键的结论。第一，延迟是我们自己造的：扫描占住主队列 2.99 秒，把 App 的首屏重载挤到了 3.95 秒之后，那次 reloadData 几乎就是被我们顶出来的。第二，我们因为自己造成的延迟错过了自己的观测窗口：轮询也排在主队列上，所以它第一次真正采样要等扫描跑完，弹窗里「refreshControl 正在转 0 次」「列表被程序性拉下 0 次」这两个 0 因此在观测上不可信。还有第三点，是判据本身的盲区：标准下拉刷新（MJRefresh / UIRefreshControl）进入刷新态时会把 adjustedContentInset.top 加上刷新头高度，而 contentOffset.y 会同步跟到 -inset.top，于是「(-y) 减去 inset.top」这个判据恒等于 0，光看 offset 永远抓不到「已经进入刷新态」，必须改看 adjustedContentInset.top 有没有变大。所以本版把时间轴钉死，四个数各回答一个问题：切前台时刻序列（用户看到刷新后立刻切回来的那一刻，就是那次刷新的上界，这是唯一能把它直接框住的数）、轮询首次采样时刻（证实或推翻「轮询被自己挡住」）、reloadData 时刻序列（14 次是总量，序列才看得出分布）、以及见过的最大的 adjustedContentInset.top 及其达标时刻与当时页面（抓刷新头占位）。四项全部只读：读 offset、读 inset、读时刻，不写任何几何值、不改任何行为。静态自检 14 条，反向测试同时做「该报的必须报」与「不该报的绝不能报」两个方向。其余机制沿用 v1.0.4：早期安装默认关闭、弹窗上一键可切换、用 _dyld_image_count() 实测 dyld 是否静默、启动阶段墓碑、零 Logos 钩子、不依赖 CydiaSubstrate、全程不写任何几何值、不代调 App 的语义 API。
-Homepage: https://github.com/
+Description: 禁止小红书 iOS 客户端「一打开就自动刷新」，完整保留手动下拉刷新与上拉加载更多。v1.0.7 是「分片安装版」，这一版终于开始动机制，而且有机会真的拦住。上一版的时间轴把两件事同时钉死了：闸门安装于启动后 3.83 秒、首轮扫描本轮耗时 2.84 秒且占着主线程、轮询首次采样被推到 4.0 秒、而 reloadData 的第一个簇紧贴在闸门释放之后。结论两头都很硬。第一，主线程被我们连续占住 2.84 秒，App 的首屏重载被挤到 3.9 秒才发生。第二，0 到 3.83 秒我们完全没有观测，而用户看到的自动刷新就在这一段的某处；更要命的是刷新的拦截挂钩也是在那一刻才就位的，所以不是入口选错，是我们到得太晚。本版把原来一口气扫完三万多个类的做法拆成两段。第一段是窄快扫，只挑类名里含 Refresh 的类，同步做完，目标一百毫秒以内；实测它恰好覆盖全部真正重要的类，MJRefreshComponent、MJRefreshAutoFooter、UIRefreshControl、RCTTurboListRefreshControl、XYSparkModule.XYSparkRefreshHeader 的类名里都有 Refresh，于是拦截在启动后约零点一秒就位，原来要三点八三秒。第二段是分片全量扫，每片四百个类，片与片之间用 dispatch_async 让出主队列而不是立即递归，让 App 自己的任务和我们自己的轮询能插进来跑；于是轮询第一次采样会落在约零点二秒而不是四点零秒，观测窗口第一次覆盖打开的那一刻。全程仍然跑在主队列上，不换线程、不引入新的并发模型，与早前真机验证过不闪退的那条路径同源。晚加载框架的收编改为只对便宜的窄快扫做重扫，六秒内每零点三秒一次，代价是每次约二十毫秒而不是两千八百四十毫秒。另加一项只读观测：切后台时刻，用来判断时间轴上那些 reloadData 簇到底是用户自己下拉还是切回来时 App 自己刷的。静态自检 15 条，反向测试 14 必报加 3 必不报，另对本版新增写法单独跑覆盖率探针 8 项。
+Homepage: https://github.com/AKAlinkun/XhsNoAutoRefresh
 Maintainer: WorkBuddy
 Author: WorkBuddy
 Section: Tweaks

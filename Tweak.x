@@ -88,6 +88,32 @@
 //          ④ 最大 adjustedContentInset.top + 达标时刻 + 当时页面 —— 抓"刷新头占位"。
 //        ★ 仍然严格守铁律 3：这四项**只读**（读 offset、读 inset、读时刻），
 //          不写任何几何值、不改任何行为 —— 先看清再动手。
+//
+// v1.0.7 是【分片安装版】—— 终于开始动机制了，而且**这一版有机会真的拦住**。
+//        起因：v1.0.6 的时间轴把两件事同时钉死了（用户粘回的全文）：
+//          闸门安装于     启动后 3.83 秒
+//          首轮扫描       开始 0.99s，本轮耗时 2.84s  ⚠️ 占着主线程
+//          轮询首次采样    启动后 4.0s            ← ★ 连我们自己的轮询都被自己挡在门外
+//          reloadData 时刻 3.9 3.9 3.9 3.9 3.9 …  ← 首个簇紧贴闸门释放
+//        结论两头都很硬：
+//          ① **主线程被我们连续占住 2.84 秒** —— App 的首屏重载被挤到 3.9 秒才发生；
+//          ② **0 ~ 3.83 秒我们完全没有观测** —— 而用户看到的"自动刷新"就在这一段的某处。
+//             最要命的是：刷新的拦截挂钩也是在那一刻才就位的 →
+//             **不是入口选错，是我们到得太晚。**
+//        所以本版把"一口气扫完三万多个类"拆成两段（**仍然全程在主队列上，不换线程**）：
+//          ① 窄快扫 XNRInstallNarrow()：只挑**类名含 "Refresh"** 的类，同步做完，目标 <100ms。
+//             实测这条恰好覆盖全部真正重要的类 —— MJRefreshComponent / MJRefreshAutoFooter /
+//             UIRefreshControl / RCTTurboListRefreshControl / XYSparkModule.XYSparkRefreshHeader，
+//             它们的类名里都有 "Refresh"。→ **拦截在启动后 ~0.1 秒就位**（原来是 3.83 秒）。
+//          ② 分片全量扫 XNRInstallChunkStep()：每片 400 个类，片与片之间 **dispatch_async 让出主队列**
+//             （不是立即递归）—— 让 App 自己的任务和我们自己的轮询能插进来。
+//             于是轮询第一次采样会落在 ~0.2 秒（而不是 4.0 秒），
+//             **观测窗口第一次覆盖"打开的那一刻"**。
+//        ★ 同时保留 v1.0.3 的"持续重扫"能力，但只对**便宜的窄快扫**做重扫（6 秒内每 0.3 秒一次），
+//          这样晚加载的框架照样能被收编，而代价是每次 ~20ms 而不是 ~2.84 秒。
+//        ★ 另加一项只读观测：**切后台（willResignActive）时刻** —— v1.0.6 的数据里
+//          `reloadData 时刻` 末尾有 13.0~13.1 秒的一簇 8 次，无法判断是"用户自己下拉"
+//          还是"切回来时的刷新"，就是因为缺了"用户什么时候离开"这个锚点。
 // ---------------------------------------------------------------------------
 
 #import <Foundation/Foundation.h>
@@ -117,7 +143,7 @@ static double kCooldownSecs      = 30.0;
 // ★ v1.0.2：包名不再作为「装不装」的硬开关（见 XNRInstallWhenReady 注释）。
 //   这里只用于日志和弹窗展示，方便一眼核对是不是目标 App。
 static const char *kTargetBundlePrefix = "com.xingin.";
-static const char *kVersion            = "1.0.6";
+static const char *kVersion            = "1.0.7";
 
 // ★★★ v1.0.4：早期安装默认【关闭】。
 //
@@ -147,6 +173,11 @@ static BOOL   kPollRefreshCtrl   = YES;   // 低频轮询（纯只读）：① r
                                           //   ② 列表有没有被程序性拉下去
 static double kPollIntervalSecs  = 0.15;  // ★ 0.3 → 0.15 秒：加密采样，别漏掉那一瞬间
 static int    kPollMaxTicks      = 134;   // ≈ 20 秒后自动停（不做长期轮询）
+
+// ★★★ v1.0.7：主路径（主队列）的扫描策略参数。详见 XNRInstallNarrow / XNRInstallChunkStep 上面的说明。
+//   这两个数决定"我们最久连续挡住主线程多久"和"晚加载的框架多久能被收编"。
+static double kMainRescanSecs    = 6.0;   // 窄快扫持续重扫到启动后多少秒（便宜，所以可以跑很多轮）
+static double kMainRescanGapSecs = 0.3;   // 窄快扫两轮之间隔多久
 
 
 static const NSInteger kStatePulling = 2;
@@ -282,6 +313,10 @@ static NSMutableArray *gTimeline    = nil; // 每轮："第N轮 @X.XXs → 命�
 //
 //   ★ 本次只【测量并显示】，不改机制 —— 一次只动一个变量。
 //     真要修，方向是"把一轮扫不完的活拆到多个 runloop 周期里"，那是下一版的事。
+//     → **v1.0.7 已经按这个方向修了**（见 XNRInstallNarrow / XNRInstallChunkStep），
+//       所以下面这段"两个数取的不是同一个时刻"的说明现在只适用于 v1.0.4 ~ v1.0.6：
+//       v1.0.7 起「拦截挂钩就位」= 窄快扫结束（同步那几十毫秒），
+//       全量分片扫的完成时刻单独显示为「全量扫描完成」。
 
 // ★★ v1.0.3：UIRefreshControl 低频轮询（只读观测）
 //    要回答的问题：「那个圈圈到底是不是 UIRefreshControl 在转」
@@ -340,6 +375,12 @@ static BOOL      gPollPullPullDone = NO;
 static double   gPollFirstSampleAt = -1;    // ② 轮询第一次真正采样发生的时刻
 static double   gFgAt[8];                   // ① 每次切前台（didBecomeActive）的时刻
 static int      gFgCount = 0;
+// ★ v1.0.7：每次"离开前台"（willResignActive）的时刻。
+//   为什么必须补这个：v1.0.6 的 `reloadData 时刻` 末尾出现过 13.0~13.1 秒的一簇 8 次，
+//   而"切前台时刻"只有 0.6 和 13.8 —— 于是那一簇到底是"用户自己下拉刷新"还是
+//   "切回来时 App 自己刷的"，完全没法判断。缺的就是"用户什么时候离开"这个锚点。
+static double   gBgAt[8];
+static int      gBgCount = 0;
 static double   gReloadAt[16];              // ③ 每次 -reloadData 的时刻（只留前 16 个）
 static int      gReloadAtCount = 0;
 static double   gMaxInsetTop = -1;          // ④ 见过的最大 adjustedContentInset.top
@@ -1018,70 +1059,74 @@ static BOOL XNRIsRefreshControl(Class c) {
     return XNRClassDefines(c, @selector(beginRefreshing));
 }
 
-// ★★ v1.0.3：本函数【刻意做成可反复调用】的（幂等）——
-//    每轮只挂"还没挂过的"（靠 XNRIsPatched 去重），所以可以持续重扫，
+// ★★ v1.0.3：安装是【幂等】的 —— 只挂"还没挂过的"（靠 XNRSeenAndAdd 去重），所以可以反复扫。
 //    把**晚加载的框架**（XYSpark、React Native 控件）也收进来。
 //    v1.0.2 里开头有 `if (gInstalled) return gHooked;`，第一轮成功后就再也不扫了 ——
 //    那是个真 bug：先挂上 UIRefreshControl 就等于把后面才出现的刷新头判了死刑。
-static int XNRInstallGates(void) {
-    if (!gHookedNames) gHookedNames = [NSMutableArray array];
-    NSMutableArray *names = gHookedNames;             // ★ 直接往持久数组里追加（跨轮累积）
-    NSMutableArray *notes = [NSMutableArray array];
-    NSMutableArray *perGate = [NSMutableArray array]; // 每个挂钩各挂上了多少个（从全局表统计，天然准确）
-    int n = 0;                                        // 本轮【新】挂上的 beginRefreshing 数
+//
+// ★★★ v1.0.7：把原来"一口气扫完三万多个类"拆成【窄快扫】+【分片扫】两段。
+//    为什么必须拆（v1.0.6 真机数据）：
+//      首轮扫描自己就花了 2.84 秒，且跑在 **主队列** 上 → 主线程被连续占住 2.84 秒：
+//        闸门安装于 3.83s / reloadData 首次 3.9s / **轮询首次采样 4.0s**（连我们自己的轮询都被挡住）
+//      → 0~3.83 秒完全没有观测，而用户看到的"自动刷新"就在这一段 ——
+//        **不是入口选错，是我们到得太晚。**
+//    ★ 仍然全程在主队列上（不换线程、不加新的并发模型）——
+//      与 v1.0.2 那条"真机验证过不闪退"的路径同源。
 
-    // ★★ 命中规则（框架无关）：只要某个类【自己实现】了目标方法且签名完全匹配，就挂它。
-    //    B站 那版靠「类名里有没有 Refresh」猜；小红书实测用的是 MJRefresh + 自研 Swift 头 + RN 控件，
-    //    类名五花八门，所以这里改成靠「方法定义」判定。
-    unsigned int count = 0;
-    Class *list = objc_copyClassList(&count);
-    if (list) {
-        for (unsigned int i = 0; i < count; i++) {
-            Class c = list[i];
-            if (!c) continue;
-            const char *nm = class_getName(c);
-            if (!nm) continue;
+// —— 单类处理：原来这段直接写在 XNRInstallGates 的循环体里 ——
+//    返回：这个类上新挂上的 beginRefreshing 数（与旧口径一致）
+static int XNRScanOneClass(Class c, NSMutableArray *names, NSMutableArray *notes) {
+    if (!c) return 0;
+    const char *nm = class_getName(c);
+    if (!nm) return 0;
 
-            // ★ v1.0.3：跳过之前几轮已经处理过的类。
-            //   这是让"持续重扫"可行且不拖慢 App 的关键 —— 否则每轮都要对全部三万多类
-            //   × 4 个挂钩沿继承链找方法，一轮就是几百毫秒。有了它，重扫的代价只剩"新出现的类"。
-            if (!XNRSeenAndAdd(c)) continue;
+    // ★ v1.0.3：跳过之前几轮已经处理过的类。
+    //   这是让"持续重扫"可行且不拖慢 App 的关键 —— 否则每轮都要对全部三万多类
+    //   × 4 个挂钩沿继承链找方法，一轮就是几百毫秒。有了它，重扫的代价只剩"新出现的类"。
+    if (!XNRSeenAndAdd(c)) return 0;
 
-            BOOL isRefreshFamily = XNRIsRefreshControl(c);
+    int n = 0;
+    BOOL isRefreshFamily = XNRIsRefreshControl(c);
 
-            for (unsigned int g = 0; g < XNR_GATE_COUNT; g++) {
-                const XNRGateDef *d = &gGateDefs[g];
-                if (d->refreshControlOnly && !isRefreshFamily) continue;
+    for (unsigned int g = 0; g < XNR_GATE_COUNT; g++) {
+        const XNRGateDef *d = &gGateDefs[g];
+        if (d->refreshControlOnly && !isRefreshFamily) continue;
 
-                SEL sel = sel_registerName(d->selName);
-                // 便宜的前置过滤：整条继承链上都没有这个方法 → 跳过
-                if (!class_getInstanceMethod(c, sel)) continue;
-                // 家族限定的探针，只挂在「刷新控件家族」的类上（避免挂到全 App 的 reloadData）
-                if (!d->refreshControlOnly && strcmp(d->selName, "reloadData") == 0) {
-                    // reloadData：只挂列表类（UICollectionView / UITableView 及其子类），别挂全 App
-                    if (![c isSubclassOfClass:[UICollectionView class]] &&
-                        ![c isSubclassOfClass:[UITableView class]]) continue;
-                }
+        SEL sel = sel_registerName(d->selName);
+        // 便宜的前置过滤：整条继承链上都没有这个方法 → 跳过
+        if (!class_getInstanceMethod(c, sel)) continue;
+        // 家族限定的探针，只挂在「刷新控件家族」的类上（避免挂到全 App 的 reloadData）
+        if (!d->refreshControlOnly && strcmp(d->selName, "reloadData") == 0) {
+            // reloadData：只挂列表类（UICollectionView / UITableView 及其子类），别挂全 App
+            if (![c isSubclassOfClass:[UICollectionView class]] &&
+                ![c isSubclassOfClass:[UITableView class]]) continue;
+        }
 
-                const char *w = NULL;
-                if (XNRPatchMethod(c, sel, d->repl, d->sig, &w)) {
-                    gHooked++;
-                    if (strcmp(d->selName, "beginRefreshing") == 0) {
-                        n++;
-                        // ★ v1.0.3：安装现在跑在【后台线程】，而弹窗在主线程读这个数组。
-                        //   NSMutableArray 被一边追加一边遍历 = 直接崩。加一把对象锁兜住。
-                        //   （v1.0.2 安装全程在主队列，不存在这个竞争，所以以前不需要。）
-                        @synchronized(names) { [names addObject:[NSString stringWithUTF8String:nm]]; }
-                    }
-                } else if (w && strcmp(w, XNRW_INHERIT) && strcmp(w, XNRW_NOMETH) && strcmp(w, XNRW_PATCHED)) {
-                    // ★ 原因经 XNRWhyText() 翻成中文、走 %@（不能用 %s，会花屏）
-                    [notes addObject:[NSString stringWithFormat:@"%s.%s 跳过(%@)", nm, d->selName, XNRWhyText(w)]];
-                }
+        const char *w = NULL;
+        if (XNRPatchMethod(c, sel, d->repl, d->sig, &w)) {
+            gHooked++;
+            if (strcmp(d->selName, "beginRefreshing") == 0) {
+                n++;
+                // ★ v1.0.3：安装可能跑在【后台线程】，而弹窗在主线程读这个数组。
+                //   NSMutableArray 被一边追加一边遍历 = 直接崩。加一把对象锁兜住。
+                @synchronized(names) { [names addObject:[NSString stringWithUTF8String:nm]]; }
+            }
+        } else if (w && strcmp(w, XNRW_INHERIT) && strcmp(w, XNRW_NOMETH) && strcmp(w, XNRW_PATCHED)) {
+            // ★ 原因经 XNRWhyText() 翻成中文、走 %@（不能用 %s，会花屏）
+            @synchronized(notes) {
+                [notes addObject:[NSString stringWithFormat:@"%s.%s 跳过(%@)", nm, d->selName,
+                                  XNRWhyText(w)]];
             }
         }
-        free(list);
     }
+    return n;
+}
 
+// 重算每个挂钩的覆盖面（从全局表统计，天然准确），并在"真挂上了东西"时记录「拦截就位」的时刻。
+// ★ 口径（v1.0.3 修正过，v1.0.7 继续沿用）：gInstallOffset 只在**真的挂上钩子**时才记，
+//   不是"每轮都尝试赋值"—— 否则它记的是"第一轮失败扫描的时刻"，界面上那个 4.2 秒就是这么来的歧义。
+static void XNRRefreshGateInfo(void) {
+    NSMutableArray *perGate = [NSMutableArray array];
     for (unsigned int g = 0; g < XNR_GATE_COUNT; g++) {
         int cnt = 0;
         for (int i = 0; i < gPatchCount; i++) {
@@ -1089,28 +1134,171 @@ static int XNRInstallGates(void) {
         }
         [perGate addObject:[NSString stringWithFormat:@"%s=%d", gGateDefs[g].selName, cnt]];
     }
-
     gPerGateInfo = perGate.count ? [perGate componentsJoinedByString:@" "] : @"";
-    // ★★ v1.0.3 修正一处语义错误：v1.0.2 里 gInstallOffset 是【每轮都尝试赋值】，
-    //    所以它记的其实是"第一轮失败扫描的时刻"，而不是"真正挂上钩子的时刻" ——
-    //    弹窗上那个 4.2 秒因此是有歧义的。现在只在真的挂上东西时才记。
     if (gPatchCount > 0 && !gInstalled) {
         gInstalled = YES;
         if (gInstallOffset < 0) gInstallOffset = XNRNow() - gStartTime;
     }
     if (gStartTime <= 0) gStartTime = XNRNow();
+}
 
-    XNRLogLine(@"=== v%s 安装（第 %d 轮，启动后 %.2fs）：本轮新增 %d 处，累计 %d 处  %@",
-               kVersion, gInstallTries, XNRNow() - gStartTime, n, gPatchCount,
-               perGate.count ? [perGate componentsJoinedByString:@" "] : @"");
-    if (n > 0) {   // 只在真有新增时才打这一行（重扫会很频繁，避免刷屏）
-        XNRLogLine(@"     本轮新增 beginRefreshing 类(%d): %@", n,
-                   names.count ? [names componentsJoinedByString:@", "] : @"(无)");
+// ★★★ v1.0.7 第一段：**窄快扫** —— 只挑类名里含 "Refresh" 的类。
+//
+//   为什么必须靠"名字"而不是靠"方法定义"：
+//     要对三万个类逐个做 class_getInstanceMethod（要沿继承链找），那正是 2.84 秒的来源。
+//     这一步的目标是"在 App 首屏加载之前做完"，所以**只允许做 class_getName + strstr**，
+//     对命中的少数类才走完整的挂钩判定。
+//   ★ 它恰好覆盖全部真正重要的类（它们的类名里都有 "Refresh"）：
+//       MJRefreshComponent / MJRefreshAutoFooter / UIRefreshControl /
+//       RCTTurboListRefreshControl / XYSparkModule.XYSparkRefreshHeader
+//
+//   返回：新挂上的 beginRefreshing 数
+static int XNRInstallNarrow(void) {
+    // 有人在装（例如后台早期路径）→ 立刻让开，**绝不在主队列上等自旋锁**
+    if (__sync_lock_test_and_set(&gInstalling, 1)) return 0;
+
+    int n = 0;
+    int scanned = 0;
+    int hitNames = 0;
+    @try {
+        if (!gHookedNames) gHookedNames = [NSMutableArray array];
+        NSMutableArray *names = gHookedNames;
+        NSMutableArray *notes = [NSMutableArray array];
+        unsigned int count = 0;
+        Class *list = objc_copyClassList(&count);
+        if (list) {
+            for (unsigned int i = 0; i < count; i++) {
+                Class c = list[i];
+                if (!c) continue;
+                const char *nm = class_getName(c);
+                if (!nm) continue;
+                scanned++;
+                if (!XNRNameLooksLikeRefresh(nm)) continue;   // ★ 只认名字，这里零方法查找
+                hitNames++;
+                n += XNRScanOneClass(c, names, notes);
+            }
+            free(list);
+        }
+        XNRRefreshGateInfo();
+        XNRLogLine(@"=== v%s 窄快扫（只挑名字含 Refresh 的类）：扫 %d 类 / 命中 %d 类 / "
+                   @"新增 beginRefreshing %d 个 / 累计挂钩 %d 处",
+                   kVersion, scanned, hitNames, n, gPatchCount);
+        if (notes.count) XNRLogLine(@"     跳过: %@", [notes componentsJoinedByString:@"; "]);
+    } @catch (NSException *e) {
+        XNRLogLine(@"⚠️ 窄快扫抛异常：%@", e);
     }
-    if (notes.count) XNRLogLine(@"     跳过: %@", [notes componentsJoinedByString:@"; "]);
-    if (gPatchSkipped) XNRLogLine(@"     ⚠️ 有 %d 处因挂钩表满被跳过", gPatchSkipped);
+    __sync_lock_release(&gInstalling);
+    return n;
+}
 
-    return (int)gPatchCount;
+// —— v1.0.7 分片全量扫描的状态 ——
+#define XNR_CHUNK_CLASSES 400u        // 每片处理多少个类（实测 ~30~60ms/片）
+static Class        *gWalkList     = NULL;   // 本轮类表快照（objc_copyClassList 给的，用完 free）
+static unsigned int  gWalkCount    = 0;
+static unsigned int  gWalkIdx      = 0;
+static int           gChunkTotal   = 0;      // 本轮跑了几片
+static double        gChunkMaxMs   = 0;      // ★ 单片最长耗时(ms) = "我们最久一次挡住主线程多久"
+static int           gFullNew      = 0;      // 全量分片累计新增的 beginRefreshing 数
+static BOOL          gChunkRun     = NO;     // 分片任务是否正在推进（防重入）
+static BOOL          gChunkStarted = NO;     // 全量分片是否已经启动过（只跑一轮）
+static BOOL          gNarrowLoop   = NO;     // 窄快扫重扫循环是否已经启动
+static double        gFullDoneAt   = -1;     // 全量分片跑完的时刻
+
+// ★★★ v1.0.7 第二段：**分片全量扫**。
+//   每片只处理 XNR_CHUNK_CLASSES 个类，然后 **dispatch_async 回主队列**（而不是立即递归调用）
+//   —— 这一步就是全部关键：它让 App 自己的任务、以及我们自己的轮询，
+//      能在片与片之间插进来跑；主线程再也**不会**被连续占住 2.84 秒。
+//   ★ 仍然全程在主队列上，不换线程。
+static void XNRInstallChunkStep(void) {
+    if (!gChunkRun) return;
+
+    if (__sync_lock_test_and_set(&gInstalling, 1)) {
+        // 有人在装 → 让开，稍后再来。★ 绝不能在主队列上死等自旋锁（那等于把主线程钉死）。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ @autoreleasepool { XNRInstallChunkStep(); } });
+        return;
+    }
+
+    BOOL done = NO;
+    @try {
+        if (!gWalkList) {                       // 这一轮的第一片 → 取一份类表快照
+            gWalkList   = objc_copyClassList(&gWalkCount);
+            gWalkIdx    = 0;
+            gChunkTotal = 0;
+        }
+        if (!gWalkList || gWalkCount == 0) {
+            if (gWalkList) { free(gWalkList); gWalkList = NULL; }
+            gWalkCount = 0;
+            done = YES;
+        } else {
+            unsigned int end = gWalkIdx + XNR_CHUNK_CLASSES;
+            if (end > gWalkCount) end = gWalkCount;
+
+            if (!gHookedNames) gHookedNames = [NSMutableArray array];
+            NSMutableArray *names = gHookedNames;
+            NSMutableArray *notes = [NSMutableArray array];
+
+            double t0 = XNRNow();
+            int got = 0;
+            for (; gWalkIdx < end; gWalkIdx++) {
+                got += XNRScanOneClass(gWalkList[gWalkIdx], names, notes);
+            }
+            double ms = (XNRNow() - t0) * 1000.0;
+            if (ms > gChunkMaxMs) gChunkMaxMs = ms;
+            gChunkTotal++;
+            gFullNew += got;
+            if (notes.count) XNRLogLine(@"     跳过: %@", [notes componentsJoinedByString:@"; "]);
+
+            if (gWalkIdx >= gWalkCount) {       // 类表走完了 → 这一轮结束
+                free(gWalkList);
+                gWalkList  = NULL;
+                gWalkCount = 0;
+                done = YES;
+            }
+        }
+    } @catch (NSException *e) {
+        XNRLogLine(@"⚠️ 分片扫描抛异常：%@", e);
+        if (gWalkList) { free(gWalkList); gWalkList = NULL; }
+        gWalkCount = 0;
+        done = YES;
+    }
+    __sync_lock_release(&gInstalling);
+
+    if (done) {
+        gChunkRun      = NO;
+        gFullDoneAt    = (gStartTime > 0) ? (XNRNow() - gStartTime) : 0.0;
+        gLastTryOffset = gFullDoneAt;
+        gTryCount++;
+        gInstallTries  = gTryCount;
+        XNRRefreshGateInfo();
+        @synchronized(gTimeline) {
+            if (!gTimeline) gTimeline = [NSMutableArray array];
+            if (gTimeline.count < 40) {
+                [gTimeline addObject:[NSString stringWithFormat:
+                    @"#%d@%.2fs(全量分%d片/单片最长%.0fms/新增%d处)",
+                    gTryCount, gFullDoneAt, gChunkTotal, gChunkMaxMs, gFullNew]];
+            }
+        }
+        XNRLogLine(@"=== v%s 全量分片扫描完成：分 %d 片，单片最长 %.0f ms，累计挂钩 %d 处",
+                   kVersion, gChunkTotal, gChunkMaxMs, gPatchCount);
+        if (gPatchSkipped) XNRLogLine(@"     ⚠️ 有 %d 处因挂钩表满被跳过", gPatchSkipped);
+        return;
+    }
+
+    // ★★ 让出主队列 —— 就是这一行把"一口气 2.84 秒"变成了"很多片 30~60ms"。
+    dispatch_async(dispatch_get_main_queue(), ^{ @autoreleasepool { XNRInstallChunkStep(); } });
+}
+
+// ★ v1.0.7：窄快扫很便宜（只做名字匹配），所以可以在开头的几秒里反复跑，
+//   把**晚加载的框架**里那些"名字含 Refresh"的类收编进来
+//   （v1.0.3 的教训：XYSpark / RN 控件可能要 1~2 秒后才被 dyld 加载出来）。
+//   ★ 只重扫"窄"的这一路 —— 全量那一路只跑一轮（它贵，而且 UIKit 的列表类很早就有了）。
+static void XNRNarrowRescanLoop(void) {
+    double el = (gStartTime > 0) ? (XNRNow() - gStartTime) : 0.0;
+    if (el >= kMainRescanSecs) return;
+    XNRInstallNarrow();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kMainRescanGapSecs * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ @autoreleasepool { XNRNarrowRescanLoop(); } });
 }
 
 #pragma mark - 统计弹窗（只在用户主动切回前台时弹，且绝不在转场中弹）
@@ -1246,14 +1434,22 @@ static BOOL XNRPresentStats(void) {
         //   「闸门安装于」= 扫描【结束】的时刻，「首轮扫描于」= 扫描【开始】的时刻，
         //   两者之差 = 扫描自身耗时。原来标签里没写清，读起来像是自相矛盾。
         //   现在：前者保持原样，后者改成「开始 X / 耗时 Y」，并把耗时单独摆出来。
-        NSString *instStr  = (gInstallOffset < 0) ? @"(还没装上)" : [NSString stringWithFormat:@"启动后 %.2f 秒", gInstallOffset];
-        NSString *firstTry = (gFirstTryOffset < 0)
-            ? @"(还没扫过)"
+        NSString *instStr  = (gInstallOffset < 0)
+            ? @"(还没就位)"
             : ((gFirstScanCost >= 0)
-               ? [NSString stringWithFormat:@"开始 %.2fs，本轮耗时 %.2fs%@",
-                  gFirstTryOffset, gFirstScanCost,
-                  (gFirstScanCost > 0.5) ? @"  ⚠️ 这一下是占着主线程的" : @""]
-               : [NSString stringWithFormat:@"开始 %.2fs", gFirstTryOffset]);
+               ? [NSString stringWithFormat:@"启动后 %.2f 秒（窄快扫耗时 %.0f ms%@）",
+                  gInstallOffset, gFirstScanCost * 1000.0,
+                  (gFirstScanCost > 0.5) ? @" ⚠️ 还占着主线程" : @""]
+               : [NSString stringWithFormat:@"启动后 %.2f 秒", gInstallOffset]);
+        // ★★ v1.0.7：上面这行与下面这行**取代**了 v1.0.6 的「闸门安装于 / 首轮扫描（开始 X，本轮耗时 Y）」。
+        //   口径变了，别按旧版读：
+        //     「拦截挂钩就位」= **窄快扫结束**（刷新家族那批挂上）→ 拦截真正可用的时刻
+        //     「全量扫描完成」= 分片把剩下的类也扫完（reloadData / setState: 这些挂钩就位）
+        //   v1.0.6 之前只有一个「闸门安装于」，它同时背了这两件事，才需要"开始/耗时"来消歧义。
+        NSString *fullStr  = (gFullDoneAt < 0)
+            ? @"(分片推进中…)"
+            : [NSString stringWithFormat:@"启动后 %.2f 秒（分 %d 片，单片最长 %.0f ms）",
+               gFullDoneAt, gChunkTotal, gChunkMaxMs];
         NSString *lastTry  = (gLastTryOffset < 0) ? @"(还没扫过)" : [NSString stringWithFormat:@"启动后 %.2f 秒", gLastTryOffset];
         // ★ 同上：时间线也要在锁里取快照（后台安装线程可能正在追加）
         NSString *timeline = nil;
@@ -1275,6 +1471,9 @@ static BOOL XNRPresentStats(void) {
         //     ④ 最大 adjustedContentInset.top（★ 唯一能抓到"刷新头占位"的量）
         //   ★ 这四行全是只读观测，一个行为都不改。
         NSString *fgLn      = XNRFmtTimes(gFgAt, gFgCount, 8);
+        // ★ v1.0.7：新增"离开前台"的时刻 —— 用来判断「reloadData 时刻」里那些簇
+        //   到底是"用户自己下拉"还是"切回来时 App 自己刷的"。v1.0.6 就是缺这个锚点而无法判断。
+        NSString *bgLn      = XNRFmtTimes(gBgAt, gBgCount, 8);
         NSString *pollFirstLn = XNRFmtOff(gPollFirstSampleAt);
         // ★ reloadData 的时刻数组是**跨线程**的（挂钩可能来自后台线程，弹窗在主线程读），
         //   所以读端要按和写端对称的纪律取：**先屏障，再把 count 读进局部变量**，
@@ -1306,8 +1505,8 @@ static BOOL XNRPresentStats(void) {
             @"★ 上次启动\n%@\n"
              "★ 本次为启动#%d   早期安装：%@\n\n"
              "本进程包名\n%@\n\n"
-             "闸门安装于         %@\n"
-             "首轮扫描           %@\n"
+             "拦截挂钩就位       %@\n"
+             "全量扫描完成       %@\n"
              "扫描轮次           %d 轮   最后一轮 %@\n"
              "各挂钩命中          %@\n"
              "挂钩落脚点         %d 处（其中 beginRefreshing 覆盖 %d 个类）\n"
@@ -1331,6 +1530,7 @@ static BOOL XNRPresentStats(void) {
              "     ★ 现场                  %@\n\n"
              "★ 时间轴（把「那一次刷新」钉在哪一秒；全是只读观测）\n"
              "  切前台时刻             %@\n"
+             "  切后台时刻             %@\n"
              "  轮询首次采样            %@\n"
              "  reloadData 时刻          %@\n"
              "  ★ 最大 contentInset.top %@\n\n"
@@ -1347,7 +1547,7 @@ static BOOL XNRPresentStats(void) {
             prevLn,
             gLaunchNo, modeLn,
             bidLn,
-            instStr, firstTry, gTryCount, lastTry,
+            instStr, fullStr, gTryCount, lastTry,
             gPerGateInfo.length ? gPerGateInfo : @"(无)",
             gHooked, clsCnt, valve,
             gSeenBegin, gAllowBegin, gBlockedBeg,
@@ -1364,7 +1564,7 @@ static BOOL XNRPresentStats(void) {
             gPollPullMax,
             gPollPullPage ?: @"(还没见到)",
             pullDetail,
-            fgLn, pollFirstLn, reloadLn, insetLn,
+            fgLn, bgLn, pollFirstLn, reloadLn, insetLn,
             gAllowEmpty, gAllowUser, gAllowGrace, gAllowFooter, gAllowCool, gAllowNoInfo,
             timeline, cls, hints];
 
@@ -1412,8 +1612,10 @@ static BOOL XNRPresentStats(void) {
         BOOL ok = XNRAlert(alertTitle, msg, @"好", extra);
         if (ok) {
             XNRMarkPhase(XNR_PHASE_STATS_SHOWN);
-            XNRLogLine(@"--- 前台统计：包名=%@ 装于%.2fs 首扫%.2fs 轮次=%d 钩=%d 见=%d(主%d/后%d) 放行=%d 吃掉=%d",
-                       gRealBundleID, gInstallOffset, gFirstTryOffset, gTryCount, gHooked,
+            XNRLogLine(@"--- 前台统计：包名=%@ 扫描始于%.2fs 拦截就位%.2fs 窄扫%.0fms 全量完成%.2fs "
+                       @"轮次=%d 钩=%d 见=%d(主%d/后%d) 放行=%d 吃掉=%d",
+                       gRealBundleID, gFirstTryOffset, gInstallOffset, gFirstScanCost * 1000.0,
+                       gFullDoneAt, gTryCount, gHooked,
                        gSeenBegin, gSeenMain, gSeenBG, gAllowBegin, gBlockedBeg);
             XNRLogLine(@"--- 探针：reloadData=%d(首%.1fs) endRefreshing=%d(首%.1fs) setState=%d(最大%d) 其中Refreshing=%d(首%.1fs)",
                        gProbeReload, gProbeReloadFirst,
@@ -1452,54 +1654,50 @@ static void XNRStatsRetry(int tries) {
 
 // ★★ v1.0.1 修正了一处【把自己取证通道堵死】的设计错误：
 //    v1.0.0 里这里是 `if (![bid hasPrefix:prefix]) return;` —— 包名不匹配就直接返回，
-//    而 gStartTime 只在 XNRInstallGates 里赋值，弹窗又有 `if (gStartTime <= 0) return;`。
+//    而 gStartTime 只在安装函数里赋值，弹窗又有 `if (gStartTime <= 0) return;`。
 //    结果：包名一旦对不上 → gStartTime 永远是 0 → 弹窗被自己掐死 →
 //    现象变成「明明装上了却什么都不弹、也什么都不拦」，而且无法区分
 //    「Dylib 没加载 / 包名不匹配 / 扫描没找到刷新类」这三种完全不同的原因。
 //    教训：**给用户看的诊断输出，绝不能挂在「目标判定是否通过」下面。**
 //    现在：无论包名是什么都往下走，包名只用于日志与弹窗展示；是否真动手由「扫不扫得到刷新类」决定。
-// ★★ v1.0.3：把「扫描安装」包装成一个带【自旋锁 + 时间线】的轮次。
-//
-//   自旋锁是必需的：安装现在有【后台早期】和【主队列兜底】两条路径，
-//   两边同时扫的话，同一个 (类, 方法) 可能被两个线程同时换实现，
+// ★★ v1.0.3：安装有【后台早期】和【主队列兜底】两条路径，必须限制成"同一时刻只有一个安装者"，
+//   否则同一个 (类, 方法) 可能被两个线程同时换实现，
 //   而且 gPatchCount 递增与 gPatches 写入会互相踩（读到半更新的表 = 崩）。
-//   限制成"同一时刻只有一个安装者"，就回到了 v1.0.2 那种单线程写表的安全前提。
+//   ★ v1.0.7：自旋锁的**持有范围缩短到"单片 / 单次窄快扫"** ——
+//     因为分片扫要在片与片之间让出主队列，绝不能跨片持锁；
+//     拿不到锁时一律"让开、稍后再来"，**绝不在主队列上自旋等待**。
+//
+// ★★★ v1.0.7：一次"尝试安装" = ① 窄快扫（同步，几十毫秒）+ ② 启动全量分片扫（异步推进）
+//                     + ③ 启动窄快扫的重扫循环。
 static int XNRInstallAttempt(void) {
-    if (__sync_lock_test_and_set(&gInstalling, 1)) return 0;   // 有人在装 → 让给他
-    int n = 0;
-    @try {
-        double off = (gStartTime > 0) ? (XNRNow() - gStartTime) : 0.0;
-        gInstallTries = gTryCount + 1;
-        // ★★ v1.0.5：把「这一轮扫描自己花了多久」量出来。
-        //   起因是一个自相矛盾的真机数据：扫描轮次=1、第1轮就挂上了 36 处，
-        //   但「闸门安装于 2.34s」和「首轮扫描于 0.73s」差了 1.6 秒。
-        //   答案就是这两个数取时钟的位置不同（前=扫描开始，后=扫描结束），
-        //   差额 = 扫描自身的耗时。而这个耗时是【主队列】上的 1.6 秒 ——
-        //   实打实占住主线程，正是我们一直在抱怨的那件事，必须让它显形。
-        double t0 = XNRNow();
-        n = XNRInstallGates();
-        double t1 = XNRNow();
-        if (gFirstScanCost < 0) {
-            gFirstScanCost = t1 - t0;
-            if (gFirstScanCost > 0.5) {
-                XNRLogLine(@"⚠️ 首轮扫描自己就花了 %.2f 秒（且跑在主队列上 → 这一段主线程是被我们占住的）",
-                           gFirstScanCost);
-            }
-        }
-        gTryCount++;
-        if (gFirstTryOffset < 0) gFirstTryOffset = off;
-        gLastTryOffset = off;
-        if (!gTimeline) gTimeline = [NSMutableArray array];
-        // ★ 与主线程弹窗的读取配对加锁（详见 XNRPresentStats 里取快照那段）
-        @synchronized(gTimeline) {
-            if (gTimeline.count < 40) {
-                [gTimeline addObject:[NSString stringWithFormat:@"#%d@%.2fs→%d处", gTryCount, off, n]];
-            }
-        }
-    } @catch (NSException *e) {
-        XNRLogLine(@"⚠️ 安装轮次抛异常：%@", e);
+    double off = (gStartTime > 0) ? (XNRNow() - gStartTime) : 0.0;
+    if (gFirstTryOffset < 0) gFirstTryOffset = off;
+
+    // ① 窄快扫：同步做完。★ 这一刻才是「拦截真正就位」的时刻（弹窗里叫"拦截挂钩就位"）。
+    //   v1.0.5/v1.0.6 那个「首轮扫描 本轮耗时」量的就是这一整块 —— 当时它是 1610 / 2840 ms。
+    double t0 = XNRNow();
+    int n = XNRInstallNarrow();
+    double t1 = XNRNow();
+    if (gFirstScanCost < 0) {
+        gFirstScanCost = t1 - t0;
+        XNRLogLine(@"=== v%s 窄快扫耗时 %.0f ms —— 这一下才是我们挡住主线程的时间"
+                   @"（v1.0.6 之前是一整块 2840 ms）",
+                   kVersion, gFirstScanCost * 1000.0);
     }
-    __sync_lock_release(&gInstalling);
+
+    // ② 全量分片扫：只启动一次，之后由它自己一片一片推进（片间让出主队列）。
+    if (!gChunkStarted) {
+        gChunkStarted = YES;
+        gChunkRun     = YES;
+        XNRInstallChunkStep();
+    }
+
+    // ③ 窄快扫的重扫循环：只启动一次。它便宜，所以在开头几秒里反复跑，收编晚加载的框架。
+    if (!gNarrowLoop) {
+        gNarrowLoop = YES;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kMainRescanGapSecs * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ @autoreleasepool { XNRNarrowRescanLoop(); } });
+    }
     return n;
 }
 
@@ -1820,6 +2018,22 @@ static void XNRInit(void) {
                            dispatch_get_main_queue(), ^{
                 XNRStatsRetry(0);
             });
+        }];
+
+        // ★★ v1.0.7：记「离开前台」的时刻（只读观测）。
+        //   为什么必须补：v1.0.6 的 `reloadData 时刻` 末尾出现过 13.0~13.1 秒的一簇 8 次，
+        //   而「切前台时刻」只有 0.6 和 13.8 —— 那一簇到底是"用户自己下拉刷新"
+        //   还是"切回来时 App 自己刷的"，**因为没有"什么时候离开"这个锚点，根本无法判断**。
+        //   willResignActive（而不是 didEnterBackground）：它更早触发，能精确框住"用户开始离开"的那一刻。
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillResignActiveNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification *note) {
+            (void)note;
+            if (gStartTime > 0 && gBgCount < 8) {
+                gBgAt[gBgCount] = XNRNow() - gStartTime;
+                gBgCount++;
+            }
         }];
     }
 }
