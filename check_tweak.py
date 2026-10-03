@@ -35,10 +35,12 @@ def _selftest():
 
     base = open(DEFAULT, "rb").read().decode("utf-8")
     cases = []
+    missing = []      # ★ 锚点找不到的用例：**必须判为失败**，见下面 mutant_ok 的说明
 
     def mutant(label, old, new):
         if old not in base:
-            print("  ! 跳过（锚点没找到，可能代码已改）：%s" % label)
+            print("  ✗ 锚点没找到：%s" % label)
+            missing.append(label)
             return
         cases.append((label, base.replace(old, new, 1)))
 
@@ -46,12 +48,17 @@ def _selftest():
     #   结论也解释不通（本轮就踩过：变异体多出一个花括号，反而让规则 5 漏报）。
     def mutant_ok(label, old, new):
         if old not in base:
-            print("  ! 跳过（锚点没找到，可能代码已改）：%s" % label)
+            # ★★ v1.0.4：锚点找不到**不能只是"跳过"** —— 那等于这条检查从此悄悄失效，
+            #   而我们恰恰是因为"检查器静默失效"栽过三次。所以这里直接判为失败，
+            #   逼着我们每次改代码后把锚点同步更新（或明确删掉这条规则）。
+            print("  ✗ 锚点没找到（这条规则的测试已经失效了，请更新锚点）：%s" % label)
+            missing.append(label)
             return
         t = base.replace(old, new, 1)
         for op, cl in [("{", "}"), ("(", ")"), ("[", "]")]:
             if t.count(op) != t.count(cl):
-                print("  ! 变异体本身括号不平衡，测试无效，已跳过：%s" % label)
+                print("  ！变异体本身括号不平衡，测试无效：%s" % label)
+                missing.append(label)
                 return
         cases.append((label, t))
 
@@ -82,9 +89,10 @@ def _selftest():
     mutant_ok("加锁后提前 return 漏解锁",
               "@finally { [lk unlock]; }", "[lk unlock];")
     # C 字符串里写中文 → 经 %s 输出会花屏（真机上才看得见的 bug）
+    #   ★ 锚点特意选 kTargetBundlePrefix：它的值不随版本号变化，不会因为"改版本号"而失效
     mutant_ok("C 字符串字面量里写中文",
-              'static const char *kVersion            = "1.0.3";',
-              'static const char *kVersion            = "版本1.0.3";')
+              'static const char *kTargetBundlePrefix = "com.xingin.";',
+              'static const char *kTargetBundlePrefix = "com.xingin.测试";')
     # 这一条是故意造括号不平衡，不做平衡校验
     cases.append(("括号不平衡", base + "\nstatic void broken(void) {\n"))
 
@@ -110,7 +118,13 @@ def _selftest():
         print("  %s %s%s" % ("✓" if caught else "✗ 没抓到！", label,
                              ("  → " + msg) if msg else ""))
 
-    print("\n反向测试：%s" % ("全部通过 ✓ 这个检查器是有效的" if ok else "有漏网之鱼 ✗ 检查器不可靠"))
+    if missing:
+        print("\n  ⚠️ 有 %d 条用例的锚点没找到 → 这些规则【当前完全没有被测到】：%s"
+              % (len(missing), "、".join(missing)))
+        print("     处理办法：把锚点更新成新代码里的等价片段；若这条规则确实不再需要，就把它删掉。")
+        ok = False
+
+    print("\n反向测试：%s" % ("全部通过 ✓ 这个检查器是有效的" if ok else "不可靠 ✗ —— 别拿它当交付依据"))
     return ok
 
 
@@ -129,6 +143,11 @@ src = raw.decode("utf-8", errors="replace")
 # 去掉注释与字符串，避免注释/字面量里的词被当成代码
 s = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
 s = re.sub(r"//[^\n]*", "", s)
+# ★ v1.0.4：`#pragma` 是预处理指令，它后面的内容是给编译器的注释性标记，**不是字符串字面量**。
+#   起因：第 13 条规则上线后，把 `#pragma mark - ... （用来定位"……"）` 里的中文引号
+#   当成了 C 字符串 → 误报。**这类"假阳性逼你改掉本来正确的代码"必须修在规则里，而不是改代码。**
+#   （只清掉行内容、保留换行符，所以后面的行号不受影响。）
+s = re.sub(r"^[ \t]*#[ \t]*pragma[^\n]*", "", s, flags=re.M)
 code = re.sub(r'"(?:[^"\\]|\\.)*"', '""', s)
 
 problems = []

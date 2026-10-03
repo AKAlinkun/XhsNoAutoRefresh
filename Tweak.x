@@ -29,11 +29,32 @@
 //        顺带修掉两个只在真机上才看得见的显示问题：弹窗标题中文花屏（%s 在 NSString 格式化里
 //        按平台默认 C 编码 MacRoman 解释，不是 UTF-8）与「挂钩类数」标签错标。
 //        一键回退：kEarlyInstall = NO（改一行即回到 v1.0.2 的主队列路径）。
+//
+// v1.0.4 是【安全优先版】—— 起因是一次真机事故：
+//        v1.0.3 装上后「第一次能打开、切后台回来还能弹窗，但**第二次打开就闪退**」。
+//        复盘：v1.0.3 让后台线程在「构造函数之后 40ms」就动手扫类表 + 换实现。
+//        但构造函数跑在 dyld 阶段，**40ms 之后 dyld 很可能还在加载其余几十个框架** ——
+//        也就是说那 40ms 根本没有"离开 dyld"，只是在 dyld 中间。
+//        在运行时还没稳定时从后台线程 objc_copyClassList + method_setImplementation，
+//        正是铁律 2 警告的那类事，表现就是这种"有时崩有时不崩"的随机崩溃。
+//        本版四条改动，每条都能单独归因：
+//          A. 早期安装**默认关闭** → 回到 v1.0.2 那条真机验证过不闪退的主队列路径；
+//             并做成**运行时可切换**（弹窗上一个按钮，下次启动生效），不需要改代码。
+//          B. 修掉根因：不再"掐表 40ms"，改成**等 dyld 真正静下来**（用 _dyld_image_count()
+//             做只读静默检测），确定 dyld 收工后才开始扫。
+//          C. 重扫窗口 3 秒 → 6 秒（冷启动 dyld 慢、热启动 UI 来得早，两边都要覆盖）。
+//          D. 新增「启动阶段墓碑」：把每个关键阶段写进 Documents/XNR_phase.log，
+//             下次启动读出并显示「上次启动止于哪一阶段」——
+//             闪退时我们什么都看不到（进程直接没了），这个墓碑就是唯一的见证者。
+//        另把只读几何观测加密（0.15s × 20s），并在"列表被程序性拉下"的那一刻
+//        顺带记下【这个 scrollView 有没有 refreshControl、顶上几个子视图是什么类】——
+//        那几乎就是直接看到"那个圈圈是谁家的"。
 // ---------------------------------------------------------------------------
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <mach-o/dyld.h>   // _dyld_image_count()：只读的"dyld 加载了几个镜像"，用于静默检测
 #import <ctype.h>
 // 注：v1.0.3 起早期安装改用 dispatch_after 串联，不再需要 <unistd.h>（usleep）。
 //     万一以后要加回阻塞式节流再 import 即可 —— 但请先看 XNREarlyInstallStep 上面的那段说明。
@@ -57,32 +78,36 @@ static double kCooldownSecs      = 30.0;
 // ★ v1.0.2：包名不再作为「装不装」的硬开关（见 XNRInstallWhenReady 注释）。
 //   这里只用于日志和弹窗展示，方便一眼核对是不是目标 App。
 static const char *kTargetBundlePrefix = "com.xingin.";
-static const char *kVersion            = "1.0.3";
+static const char *kVersion            = "1.0.4";
 
-// ★★★ v1.0.3：只改【安装时机】这一个机制，其余全是只读观测。
+// ★★★ v1.0.4：早期安装默认【关闭】。
 //
-// 真机数据（v1.0.2）把问题钉在了时间上，而不是入口上：
-//     闸门安装于        启动后 4.2 秒
-//     reloadData     13 次   首次 启动后 4.3s
-//     endRefreshing   0 次
-//     setState: 总写入 0 次      ← 连一次都没有
-// 用户的现象是「打开就直接刷新」，发生在启动后 1~2 秒。
-// → **钩子在 4.2 秒才挂上，那一次刷新早就打完了，我们根本没赶上。**
-//   这也解释了为什么所有刷新探针都是 0：不是入口选错了，是时间不对。
+// 真机事故（v1.0.3）：装上后「第一次能打开、切后台回来能弹窗，第二次打开就闪退」。
+// 复盘结论：v1.0.3 让后台线程在「构造函数之后 40ms」就扫类表 + 换实现。
+//   但构造函数跑在 dyld 阶段 —— **40ms 之后 dyld 往往还在加载其余几十个框架**，
+//   那 40ms 根本没有"离开 dyld"，只是在 dyld 中间。
+//   在运行时还没稳定时从后台线程 objc_copyClassList + method_setImplementation，
+//   正是铁律 2 警告的那类事 → 表现就是"有时崩有时不崩"的随机崩溃。
+//   （这也解释了为什么第一次能开：冷启动那 4 秒里主线程被占满，
+//     我们的后台扫描先跑完了，没和应用自己的 UI 活动重叠。热启动就不一样了。）
 //
-// 为什么原方案会晚到 4.2 秒：v1.0.1/1.0.2 只把安装排到【主队列】上，
-// 而 App 启动时主线程被 dyld 加载几十个框架 + 自己的启动任务占满，
-// 排在上面的任务要等它整段跑完才轮到 —— 于是「排得早」并不等于「跑得早」。
-static BOOL   kEarlyInstall      = YES;   // ★ 后台早期安装（本版唯一的机制改动）
-                                          //   ⚠️ 安全阀：万一装上后【一开就闪退】，把它改成 NO，
-                                          //      即回到 v1.0.2 的主队列路径，其它功能不受影响。
-static double kEarlyFirstDelayMs = 40.0;  // 首次后台扫描前的等待(ms)：给 dyld 一点时间，
-                                          //   避免恰好在镜像加载中途去扫类表
-static double kEarlyRescanSecs   = 3.0;   // ★ 持续重扫到启动后多少秒
-                                          //   必须保留：晚加载的框架（XYSpark、RN 控件）只有等它出现才能挂上
-static double kEarlyIntervalMs   = 80.0;  // 重扫间隔(ms)
+// 所以本版：**默认走主队列那条真机验证过不闪退的路径**，早期安装降级为**可选实验**，
+// 且改成"等 dyld 静下来再动手"（见 XNRDyldSettled）。
+// ⚠️ 用户可以在弹窗上点按钮切换，下次启动生效，**不需要改代码/重新编译**。
+static NSString *kEarlyInstallKey      = @"XNREarlyInstall";   // 存 NSUserDefaults 的键
+static BOOL      kEarlyInstall         = NO;   // ★ 默认关！运行时会被 UserDefaults 覆盖
+
+// —— 早期安装（仅在 kEarlyInstall = YES 时生效）的三个参数 ——
+static double kDyldSampleMs     = 50.0;   // 每多少毫秒抽查一次 dyld 镜像数
+static double kDyldQuietSamples = 5.0;    // 连续多少次"没有新镜像"才认为 dyld 收工（5×50ms=250ms）
+static double kDyldMaxWaitSecs  = 12.0;   // 兜底：最多等这么久，超时就照常开始（别无限等）
+static double kEarlyRescanSecs  = 6.0;    // ★ 持续重扫到启动后多少秒（3→6：冷启动 dyld 更慢）
+static double kEarlyIntervalMs  = 150.0;  // 重扫间隔(ms)。6s / 150ms ≈ 40 轮
+
 static BOOL   kPollRefreshCtrl   = YES;   // 低频轮询（纯只读）：① refreshControl.isRefreshing
-                                          //   ② 列表有没有被程序性拉下去。上限 70 次（约 21 秒）自动停
+                                          //   ② 列表有没有被程序性拉下去
+static double kPollIntervalSecs  = 0.15;  // ★ 0.3 → 0.15 秒：加密采样，别漏掉那一瞬间
+static int    kPollMaxTicks      = 134;   // ≈ 20 秒后自动停（不做长期轮询）
 
 
 static const NSInteger kStatePulling = 2;
@@ -183,6 +208,7 @@ static int  gAllowFooter = 0;    // 上拉加载更多
 static int  gAllowNoInfo = 0;    // 拿不到判断依据（宁可漏拦）
 
 static BOOL gInstalled = NO;
+static BOOL gMainInstallMarked = NO;   // 是否已经写过 main-install-done 这行墓碑（只写一次）
 static int  gInstallTries = 0;   // 第几轮尝试安装（用于日志与重试上限）
 static NSString *gRealBundleID = nil;   // ★ 本进程真实包名 —— 排障第一信息，直接打进弹窗
 
@@ -221,6 +247,11 @@ static int      gPollPullHits  = 0;     // 见到"程序性下拉"的次数
 static double   gPollPullFirst = -1;    // 首次见到的时刻 ★ 关键数据
 static double   gPollPullMax   = 0;     // 下拉得最深的一次（点）
 static NSString *gPollPullPage = nil;   // 首次见到时所在的页面
+// ★ v1.0.4 追加：第一次抓到"程序性下拉"的现场快照 —— 这就是"那个圈圈是谁家的"的答案。
+//   记三件事：① scrollView 自己的类名；② 它有没有 refreshControl（有的话是什么类）；
+//            ③ 它顶部那几个子视图是什么类（刷新头一定在其中）。
+static NSString *gPollPullDetail = nil;
+static BOOL      gPollPullPullDone = NO;
 
 static NSTimeInterval gStartTime     = 0;
 static NSTimeInterval gLastAllow     = 0;
@@ -231,6 +262,119 @@ static int            gBlockInWindow = 0;
 static double gFirstSeenOffset = -1.0;   // ★ 首次触发发生在启动后多少秒（决定宽限该设多少）
 static BOOL   gFirstSeenBlocked = NO;    // 首次触发是被吃掉了还是被放行了
 static BOOL   gFirstSeenDone    = NO;    // 是否已经记过「首次触发」
+
+#pragma mark - ★★ v1.0.4 启动阶段墓碑（用来定位"上次崩在哪一阶段"）
+
+// 起因：v1.0.3 真机上「第一次能开，第二次打开就闪退」—— 闪退时我们**什么都看不到**：
+//       进程直接没了，弹窗没机会弹，NSLog 也留在设备上拿不出来。
+//       **唯一的办法是让程序在崩溃之前，一路把"我到哪儿了"写到磁盘上。**
+//
+// 做法：每到一个关键阶段，就往 Documents/XNR_phase.log 追加一行：
+//         launch#N | 阶段名 | 启动后X.XXXs
+//       每行都 open→seek→write→close，**立刻落盘、不经缓存**（要的就是"崩了也能留下"）。
+//       下次启动时读这个文件：找出"上一次启动"那批行里的最后一行，
+//       就知道上次**止步于哪个阶段** —— 这比任何猜测都硬。
+//
+// 为什么用独立文件而不是复用 XNR_fix.log：
+//   ① 墓碑必须逐行落盘、绝不能和别的日志共享缓冲/锁；
+//   ② 即使 XNR_fix.log 被写坏，也不该影响这个判断。
+//
+// 阶段名（ASCII，见 check_tweak.py 第 13 条：C 字符串不许带中文）：
+//   constructor          构造函数里 gStartTime 落地
+//   early-wait-dyld      后台开始等 dyld 静默
+//   dyld-settled         dyld 静默达成（镜像数不再变化）
+//   early-scan-done      早期安装扫完整个窗口
+//   main-install-done    主队列那次安装完成
+//   stats-shown          统计弹窗成功弹出
+//   poll-done            轮询结束
+#define XNR_PHASE_CONSTRUCTOR   "constructor"
+#define XNR_PHASE_EARLY_WAIT    "early-wait-dyld"
+#define XNR_PHASE_DYLD_SETTLED  "dyld-settled"
+#define XNR_PHASE_EARLY_DONE    "early-scan-done"
+#define XNR_PHASE_MAIN_DONE     "main-install-done"
+#define XNR_PHASE_STATS_SHOWN   "stats-shown"
+#define XNR_PHASE_POLL_DONE     "poll-done"
+
+static NSString *XNRPhasePath(void) {
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/XNR_phase.log"];
+}
+
+static int      gLaunchNo       = 0;     // 本次启动的序号（从墓碑文件的已有记录里推出来）
+static NSString *gPrevPhaseName = nil;   // 上一次启动止步于哪个阶段
+static double   gPrevPhaseAt    = -1;    // 上一次启动止步于启动后多少秒
+static int      gPrevLaunchNo   = 0;
+
+// 启动时调用一次：算出本次序号 + 读出"上一次止步阶段"
+static void XNRPhaseLoad(void) {
+    @try {
+        NSString *all = [NSString stringWithContentsOfFile:XNRPhasePath()
+                                                  encoding:NSUTF8StringEncoding
+                                                     error:NULL];
+        if (!all.length) { gLaunchNo = 1; return; }
+
+        int maxNo = 0;
+        NSMutableArray *lines = [NSMutableArray array];
+        for (NSString *ln in [all componentsSeparatedByString:@"\n"]) {
+            if (!ln.length) continue;
+            [lines addObject:ln];
+            NSArray *f = [ln componentsSeparatedByString:@"|"];
+            if (f.count >= 2) {
+                int no = [[f[0] stringByTrimmingCharactersInSet:
+                           [NSCharacterSet whitespaceCharacterSet]] intValue];
+                if (no > maxNo) maxNo = no;
+            }
+        }
+        gLaunchNo = maxNo + 1;
+
+        // 找"最大的、且小于本次序号"的那一批 → 上一次启动
+        int prevNo = 0;
+        for (NSString *ln in lines) {
+            NSArray *f = [ln componentsSeparatedByString:@"|"];
+            if (f.count < 3) continue;
+            int no = [[f[0] stringByTrimmingCharactersInSet:
+                       [NSCharacterSet whitespaceCharacterSet]] intValue];
+            if (no > 0 && no < gLaunchNo && no > prevNo) prevNo = no;
+        }
+        if (prevNo <= 0) return;
+        for (NSString *ln in lines) {
+            NSArray *f = [ln componentsSeparatedByString:@"|"];
+            if (f.count < 3) continue;
+            int no = [[f[0] stringByTrimmingCharactersInSet:
+                       [NSCharacterSet whitespaceCharacterSet]] intValue];
+            if (no != prevNo) continue;
+            gPrevLaunchNo   = prevNo;
+            gPrevPhaseName  = [f[1] stringByTrimmingCharactersInSet:
+                               [NSCharacterSet whitespaceCharacterSet]];
+            gPrevPhaseAt    = [[f[2] stringByTrimmingCharactersInSet:
+                                [NSCharacterSet whitespaceCharacterSet]] doubleValue];
+        }
+    } @catch (NSException *e) { (void)e; }
+}
+
+// 追加一行墓碑。线程安全、不依赖任何其它设施、失败就悄悄算了（永远不能因为它崩）。
+static void XNRMarkPhase(const char *name) {
+    if (gLaunchNo <= 0) return;
+    static NSLock *lock = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [[NSLock alloc] init]; });
+
+    [lock lock];
+    @try {
+        double at = (gStartTime > 0) ? (XNRNow() - gStartTime) : 0.0;
+        NSString *line = [NSString stringWithFormat:@"launch#%d | %s | %.3f\n",
+                          gLaunchNo, name ? name : "?", at];
+        NSString *path = XNRPhasePath();
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (![fm fileExistsAtPath:path]) [fm createFileAtPath:path contents:nil attributes:nil];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (fh) {
+            @try { [fh seekToEndOfFile];
+                    [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; }
+            @finally { [fh closeFile]; }        // ★ 无论如何都要关掉，否则句柄泄漏
+        }
+    } @catch (NSException *e) { (void)e; }
+    @finally { [lock unlock]; }
+}
 
 // ★★ v1.0.2 新增：只读探针（只数数、不改行为、一律调用原实现）
 //    起因：真机数据显示「7 个刷新控件都挂上了，但 beginRefreshing 一次都没被调用」
@@ -894,7 +1038,11 @@ static BOOL XNRCanPresent(void) {
     } @catch (NSException *e) { (void)e; return NO; }
 }
 
-static BOOL XNRAlert(NSString *title, NSString *msg, NSString *btn) {
+// ★ v1.0.4：多了一个可选的"额外按钮 + 回调"，用来在弹窗上直接切换「早期安装」开关。
+//   为什么要做成按钮：真机闪退后用户没法改代码重编译，而**必须能自己把那个开关关掉**。
+//   （extraTitle 传 nil 就是老行为。）
+static BOOL XNRAlert(NSString *title, NSString *msg, NSString *btn,
+                     NSString *extraTitle, void (^extraBlock)(void)) {
     if (!kShowAlert) return NO;
     if (![NSThread isMainThread]) return NO;
     if (!XNRCanPresent()) return NO;
@@ -903,6 +1051,14 @@ static BOOL XNRAlert(NSString *title, NSString *msg, NSString *btn) {
                                                                   message:msg
                                                            preferredStyle:UIAlertControllerStyleAlert];
         [a addAction:[UIAlertAction actionWithTitle:btn style:UIAlertActionStyleDefault handler:nil]];
+        if (extraTitle.length) {
+            [a addAction:[UIAlertAction actionWithTitle:extraTitle
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *act) {
+                (void)act;
+                if (extraBlock) extraBlock();
+            }]];
+        }
         [XNRRootVC() presentViewController:a animated:YES completion:nil];
         return YES;
     } @catch (NSException *e) { (void)e; return NO; }
@@ -974,9 +1130,27 @@ static BOOL XNRPresentStats(void) {
         }
         NSString *maxState = (gProbeSetMaxState < 0) ? @"没写过" : [NSString stringWithFormat:@"%d", gProbeSetMaxState];
         NSString *pollPage = gPollPage ?: @"(还没见到)";
+        NSString *pullDetail = gPollPullDetail.length ? gPollPullDetail : @"(还没抓到现场)";
+
+        // ★★ v1.0.4：把"上一次启动止步于哪一阶段"摆到最上面 —— 闪退唯一的见证者。
+        NSString *prevLn = nil;
+        if (gPrevLaunchNo <= 0) {
+            prevLn = @"(墓碑里还没有上一次的记录)";
+        } else {
+            prevLn = [NSString stringWithFormat:@"启动#%d 止于 %@ @ %.2fs%@",
+                      gPrevLaunchNo, gPrevPhaseName ?: @"?", gPrevPhaseAt,
+                      ([gPrevPhaseName isEqualToString:@"stats-shown"] ||
+                       [gPrevPhaseName isEqualToString:@"poll-done"])
+                        ? @"（看起来是正常走完的）" : @"  ⚠️ 之后就没有记录了 → 很可能就崩在这一步之后"];
+        }
+        NSString *modeLn = kEarlyInstall
+            ? @"开（后台早期安装；若闪退请点下面的按钮关掉）"
+            : @"关（只走主队列，安全）";
 
         NSString *msg = [NSString stringWithFormat:
-            @"本进程包名\n%@\n\n"
+            @"★ 上次启动\n%@\n"
+             "★ 本次为启动#%d   早期安装：%@\n\n"
+             "本进程包名\n%@\n\n"
              "闸门安装于         %@\n"
              "首轮扫描于         %@\n"
              "扫描轮次           %d 轮   最后一轮 %@\n"
@@ -998,7 +1172,8 @@ static BOOL XNRPresentStats(void) {
              "     首次所在页面            %@\n"
              "  ② 列表被程序性拉下         %d 次   首次 %@\n"
              "     最深拉下                %.0f pt\n"
-             "     首次所在页面            %@\n\n"
+             "     首次所在页面            %@\n"
+             "     ★ 现场                  %@\n\n"
              "放行原因明细（判断插件是否按预期工作的关键）\n"
              "  列表还没内容(首屏加载)  %d\n"
              "  用户自己在拖            %d\n"
@@ -1009,6 +1184,8 @@ static BOOL XNRPresentStats(void) {
              "安装时间线（#轮次@时刻→本轮新增）:\n%@\n\n"
              "挂钩的类:\n%@\n\n"
              "抓到的事件（含调用栈，每类最多 3 条）:\n%@",
+            prevLn,
+            gLaunchNo, modeLn,
             bidLn,
             instStr, firstTry, gTryCount, lastTry,
             gPerGateInfo.length ? gPerGateInfo : @"(无)",
@@ -1026,11 +1203,22 @@ static BOOL XNRPresentStats(void) {
             gPollPullHits, XNRFmtOff(gPollPullFirst),
             gPollPullMax,
             gPollPullPage ?: @"(还没见到)",
+            pullDetail,
             gAllowEmpty, gAllowUser, gAllowGrace, gAllowFooter, gAllowCool, gAllowNoInfo,
             timeline, cls, hints];
 
-        BOOL ok = XNRAlert([NSString stringWithFormat:@"XhsNoRefresh v%s 统计", kVersion], msg, @"好");
+        // ★ v1.0.4：弹窗上直接给一个开关（下次启动生效），这样即使闪退也不需要改代码
+        NSString *toggle = kEarlyInstall ? @"关闭早期安装（下次启动生效，更安全）"
+                                         : @"开启早期安装（下次启动生效，有闪退风险）";
+        BOOL ok = XNRAlert([NSString stringWithFormat:@"XhsNoRefresh v%s 统计", kVersion],
+                           msg, @"好", toggle, ^{
+            BOOL want = !kEarlyInstall;
+            [[NSUserDefaults standardUserDefaults] setBool:want forKey:kEarlyInstallKey];
+            [[NSUserDefaults standardUserDefaults] synchronize];
+            XNRLogLine(@"=== 用户切换早期安装 → %@（下次启动生效）", want ? @"开" : @"关");
+        });
         if (ok) {
+            XNRMarkPhase(XNR_PHASE_STATS_SHOWN);
             XNRLogLine(@"--- 前台统计：包名=%@ 装于%.2fs 首扫%.2fs 轮次=%d 钩=%d 见=%d(主%d/后%d) 放行=%d 吃掉=%d",
                        gRealBundleID, gInstallOffset, gFirstTryOffset, gTryCount, gHooked,
                        gSeenBegin, gSeenMain, gSeenBG, gAllowBegin, gBlockedBeg);
@@ -1043,6 +1231,9 @@ static BOOL XNRPresentStats(void) {
                        gPollTicks, gPollScrollSeen, gPollHits, gPollFirst, gPollPage ?: @"-");
             XNRLogLine(@"--- 轮询：②程序性拉下 %d 次（首次 %.2fs 于 %@，最深 %.0fpt）",
                        gPollPullHits, gPollPullFirst, gPollPullPage ?: @"-", gPollPullMax);
+            XNRLogLine(@"--- 下拉现场：%@", gPollPullDetail ?: @"(没抓到)");
+            XNRLogLine(@"--- 墓碑：本次 启动#%d，上次 启动#%d 止于 %@@%.2fs",
+                       gLaunchNo, gPrevLaunchNo, gPrevPhaseName ?: @"-", gPrevPhaseAt);
         }
         return ok;
     } @catch (NSException *e) { (void)e; return NO; }
@@ -1137,11 +1328,15 @@ static void XNRInstallWhenReady(int tries) {
 
         XNRInstallAttempt();
 
-        if (gInstalled) return;                 // 挂上了，兜底路径收工
+        if (gInstalled) {                       // 挂上了，兜底路径收工
+            if (!gMainInstallMarked) { gMainInstallMarked = YES;
+                XNRMarkPhase(XNR_PHASE_MAIN_DONE); }
+            return;
+        }
 
         if (tries + 1 >= XNR_MAX_TRIES) {
             XNRLogLine(@"⚠️ 兜底路径试了 %d 轮仍未挂上任何钩子"
-                       @"（早期安装那边还在继续扫，看 XNR_fix.log 的安装时间线）", XNR_MAX_TRIES);
+                       @"（若开了早期安装，看 XNR_fix.log 的安装时间线）", XNR_MAX_TRIES);
             return;
         }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
@@ -1153,9 +1348,9 @@ static void XNRInstallWhenReady(int tries) {
     }
 }
 
-// ★★★ v1.0.3 的核心机制：后台早期安装 + 持续重扫。
+// ★★★ v1.0.3 的机制：后台早期安装 + 持续重扫。（v1.0.4 起默认关闭，见 kEarlyInstall）
 //
-//   为什么必须离开主队列：v1.0.2 实测「闸门安装于 启动后 4.2 秒」，
+//   为什么离开主队列：v1.0.2 实测「闸门安装于 启动后 4.2 秒」，
 //   而用户的现象（打开就刷新）发生在启动后 1~2 秒 —— 钩子挂上时那一次早打完了。
 //   App 启动时主线程被 dyld 加载几十个框架 + 自己的启动任务占满，
 //   排在主队列上的任务要等它整段跑完才轮到。**排得早 ≠ 跑得早。**
@@ -1163,17 +1358,65 @@ static void XNRInstallWhenReady(int tries) {
 //   为什么必须持续重扫：晚加载的框架（XYSpark、React Native 控件）在头几百毫秒里还不存在，
 //   只扫一轮的话永远挂不上它们。（v1.0.2 里"第一轮成功就 return"也是同一个 bug 的一种形态。）
 //
-//   为什么敢在后台线程动 ObjC 运行时：
-//     · 铁律 2 禁止的是【在 dyld 构造函数里立刻碰运行时】——这里是构造函数返回之后、
-//       在另一个线程上执行，且首轮刻意延迟 kEarlyFirstDelayMs 避开镜像加载最密集的时刻；
-//     · 整个过程【只碰运行时，绝不碰 UIKit】（不读视图、不弹窗、不碰主线程状态）；
-//     · 整段包在 @try 里，并被自旋锁串行化；
-//     · 留了一键回退开关 kEarlyInstall = NO（改一行就回到 v1.0.2 的主队列路径）。
+//   ★★★ v1.0.4 修掉的根因（这一段是这次真机闪退的复盘）：
+//     v1.0.3 写的是"构造函数之后 40ms 就开始扫"。当时的想法是"构造函数在 dyld 里，
+//     等 40ms 就离开 dyld 了" —— **这个想法是错的**。
+//     构造函数跑在 dyld 序列的早期，而 dyld 要加载几十个框架；
+//     **构造函数之后 40ms，dyld 多半还在加载剩下的那些**。那 40ms 根本没有"离开 dyld"，
+//     只是在 dyld 中间。在运行时还没稳定时从后台线程 objc_copyClassList +
+//     method_setImplementation，正是铁律 2 警告的那类事。
+//     → 真机表现：`第一次能打开、切后台回来还能弹窗，第二次打开就闪退`（随机崩溃）。
+//
+//   ★ 正确的判据不是"掐表"，而是"**dyld 到底有没有收工**"：
+//     用 `_dyld_image_count()`（只读一个计数器，任何时刻调用都安全、不碰 ObjC 运行时）
+//     每 50ms 抽样一次，**连续 5 次都没有新镜像加入** → 认为 dyld 收工，才允许开始扫。
+//     这比任何固定毫秒数都可靠：冷启动 dyld 可能要好几秒，热启动可能只要几百毫秒。
+//
 //   ★ 为什么用 dispatch_after 串起来、而不是 usleep 循环：
-//     GCD 全局并发队列的工作线程数是有限的（通常远小于我们想扫的轮数）。用 usleep 把
-//     线程按住 3 秒，等于从系统的线程池里"借走"一个线程不放 —— 轻则拖慢 App 自己的后台任务，
-//     重则让线程池饥饿。dispatch_after 是"排一个将来的时间点"，**排完立刻归还线程**，全程不占用。
-//     代价只是一点时间精度（毫秒级），而我们本来就只需要"在前 3 秒里多扫几十轮"。
+//     GCD 全局并发队列的工作线程数是有限的。用 usleep 把线程按住几秒，等于从系统的线程池里
+//     "借走"一个线程不放 —— 轻则拖慢 App 自己的后台任务，重则让线程池饥饿。
+//     dispatch_after 是"排一个将来的时间点"，**排完立刻归还线程**，全程不占用。
+static BOOL XNRDyldSettled(void) {
+    // 只被后台这一条链调用，所以函数内 static 不需要加锁
+    static uint32_t lastCount = 0;
+    static int      quiet     = 0;
+    uint32_t now = _dyld_image_count();
+    if (now == lastCount) quiet++;
+    else { quiet = 0; lastCount = now; }
+    return (quiet >= (int)kDyldQuietSamples);
+}
+
+static void XNREarlyInstallStep(int round);      // 前置声明（下面定义）
+
+// 第一阶段：等 dyld 静下来。只有在 kEarlyInstall = YES 时才会走到这里。
+static void XNRDyldWaitStep(int round) {
+    if (!kEarlyInstall) return;
+
+    double elapsed = (gStartTime > 0) ? (XNRNow() - gStartTime) : 0.0;
+
+    if (XNRDyldSettled()) {
+        XNRMarkPhase(XNR_PHASE_DYLD_SETTLED);
+        XNRLogLine(@"=== dyld 已静下来（镜像数 %u，等了约 %.2fs），开始早期安装",
+                   _dyld_image_count(), elapsed);
+        XNREarlyInstallStep(0);
+        return;
+    }
+
+    if (elapsed >= kDyldMaxWaitSecs) {
+        // 兜底：万一某个 App 一直在 dlopen，也别无限等下去
+        XNRLogLine(@"⚠️ 等 dyld 静默超时（%.1fs，当前镜像数 %u），仍按计划开始安装",
+                   elapsed, _dyld_image_count());
+        XNREarlyInstallStep(0);
+        return;
+    }
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kDyldSampleMs * NSEC_PER_MSEC)),
+                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        @autoreleasepool { XNRDyldWaitStep(round + 1); }
+    });
+}
+
+// 第二阶段：持续重扫（幂等），直到启动后 kEarlyRescanSecs 秒
 static void XNREarlyInstallStep(int round) {
     if (!kEarlyInstall) return;
 
@@ -1184,6 +1427,7 @@ static void XNREarlyInstallStep(int round) {
     if (elapsed >= kEarlyRescanSecs) {
         XNRLogLine(@"--- 早期安装收工：共扫 %d 轮，累计 %d 处，最后一次在启动后 %.2fs",
                    gTryCount, gPatchCount, gLastTryOffset);
+        XNRMarkPhase(XNR_PHASE_EARLY_DONE);
         return;
     }
 
@@ -1230,6 +1474,31 @@ static void XNRPollScan(UIView *v) {
                     XNRLogLine(@"🔎 轮询发现列表被程序性拉下 %.0fpt（没人在拖）：启动后 %.2fs  页面: %@",
                                over, gPollPullFirst, gPollPullPage ?: @"?");
                 }
+                // ★★ v1.0.4：抓一次"现场" —— 这是"那个圈圈到底是谁家的"唯一的直接证据。
+                //   我们没法从钩子看（一次都没触发），那就看**那一刻列表顶上到底摆着什么视图**。
+                if (!gPollPullPullDone) {
+                    gPollPullPullDone = YES;
+                    @try {
+                        NSString *rcInfo = sv.refreshControl
+                            ? [NSString stringWithFormat:@"有(UIRefreshControl 系) 正在转=%@",
+                               sv.refreshControl.isRefreshing ? @"是" : @"否"]
+                            : @"没有 refreshControl → 刷新头是自研的";
+                        NSMutableArray *tops = [NSMutableArray array];
+                        for (UIView *sub in sv.subviews) {
+                            if (sub.hidden) continue;
+                            if (sub.frame.origin.y <= 200.0) {
+                                [tops addObject:NSStringFromClass(object_getClass(sub))];
+                                if (tops.count >= 6) break;
+                            }
+                        }
+                        gPollPullDetail = [NSString stringWithFormat:
+                            @"scrollView=%@ / %@ / 顶部子视图: %@",
+                            NSStringFromClass(object_getClass(sv)),
+                            rcInfo,
+                            tops.count ? [tops componentsJoinedByString:@", "] : @"(无)"];
+                        XNRLogLine(@"🔎 下拉现场：%@", gPollPullDetail);
+                    } @catch (NSException *e) { (void)e; }
+                }
             }
         }
         for (UIView *sub in v.subviews) XNRPollScan(sub);
@@ -1238,8 +1507,12 @@ static void XNRPollScan(UIView *v) {
 
 static void XNRPollTick(int tick) {
     if (!kPollRefreshCtrl) return;
-    if (tick >= 70) return;                       // 约 21 秒后自动停，不做长期轮询
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+    if (tick >= kPollMaxTicks) {                  // 约 20 秒后自动停，不做长期轮询
+        XNRMarkPhase(XNR_PHASE_POLL_DONE);
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(kPollIntervalSecs * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         @try {
             gPollTicks++;
@@ -1266,22 +1539,32 @@ static void XNRInit(void) {
         if (!gHookedNames) gHookedNames = [NSMutableArray array];
         if (!gTimeline)    gTimeline    = [NSMutableArray array];
 
-        // ★★★ v1.0.3 主路径：后台队列立刻起步（不走主队列，因此不会被 App 启动堵住）
-        //    首轮刻意延迟 kEarlyFirstDelayMs，避开 dyld 加载镜像最密集的那一瞬间。
-        if (kEarlyInstall) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                         (int64_t)(kEarlyFirstDelayMs * NSEC_PER_MSEC)),
-                           dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-                @autoreleasepool { XNREarlyInstallStep(0); }
-            });
-        }
+        // ★★★ v1.0.4：先读两样东西 —— ① 用户上次在弹窗里选的"是否开启早期安装"；
+        //     ② 墓碑文件里"上一次启动止步于哪个阶段"。
+        //     两者都必须在排任何任务之前就位，否则第一条日志/第一行墓碑会缺信息。
+        //     ⚠️ 这里只做**字符串与文件读写**，不碰运行时 —— 构造函数可以安全做。
+        kEarlyInstall = [[NSUserDefaults standardUserDefaults] boolForKey:kEarlyInstallKey];
+        XNRPhaseLoad();
+        XNRMarkPhase(XNR_PHASE_CONSTRUCTOR);
 
-        // 兜底路径：主队列（可能要到 4 秒后才轮到，所以只当保险）
+        // ★★★ v1.0.4 主路径：主队列（= v1.0.2 那条真机验证过不闪退的路径）
+        //     构造函数里排的块，会在主线程第一次有空时**最先**跑（排在 App 自己的任务前面）。
         dispatch_async(dispatch_get_main_queue(), ^{
             XNRInstallWhenReady(0);
         });
 
-        // 只读观测：低频轮询 UIRefreshControl 的刷新状态
+        // ★ 可选的早期安装（默认关闭；用户可在弹窗上开启，下次启动生效）
+        //   注意：**先等 dyld 静下来**再动手，绝不"掐表 40ms"（见 XNRDyldWaitStep 上面的复盘）。
+        if (kEarlyInstall) {
+            XNRMarkPhase(XNR_PHASE_EARLY_WAIT);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)(kDyldSampleMs * NSEC_PER_MSEC)),
+                           dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+                @autoreleasepool { XNRDyldWaitStep(0); }
+            });
+        }
+
+        // 只读观测：低频轮询（refreshControl.isRefreshing + 列表是否被程序性拉下）
         dispatch_async(dispatch_get_main_queue(), ^{
             XNRPollTick(0);
         });
