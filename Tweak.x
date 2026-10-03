@@ -560,6 +560,10 @@ static void XNRHookedSetState(id self, SEL _cmd, NSInteger st) {
 //       类名含 "Refresh"  或  该类自己实现了 -beginRefreshing
 //     —— 单靠类名会漏掉名字奇怪的实现；单靠 beginRefreshing 会漏掉不实现它的自研控件。
 //        两条并集，两边都不漏。
+// ★ label 是 const char *（不是 NSString *）：这个数组是【静态存储期】的初始化器，
+//   ObjC 的 @"..." 字面量在静态初始化里既不是编译期常量、类型也对不上，
+//   clang 会直接以 -Werror,-Wincompatible-pointer-types 报错（v1.0.2 首轮 CI 就栽在这）。
+//   → 静态初始化器里只允许 C 字符串字面量。
 typedef struct {
     const char     *selName;
     IMP             repl;
@@ -569,10 +573,10 @@ typedef struct {
 } XNRGateDef;
 
 static const XNRGateDef gGateDefs[] = {
-    { "beginRefreshing",  (IMP)&XNRHookedBeginRefreshing, XNRSigVoidNoArg,  NO,  @"拦截+计数" },
-    { "endRefreshing",    (IMP)&XNRHookedEndRefreshing,   XNRSigVoidNoArg,  YES, @"探针:刷新结束" },
-    { "setState:",        (IMP)&XNRHookedSetState,        XNRSigVoidIntArg, YES, @"探针:状态被写" },
-    { "reloadData",       (IMP)&XNRHookedReloadData,      XNRSigVoidNoArg,  NO,  @"探针:列表重载" },
+    { "beginRefreshing",  (IMP)&XNRHookedBeginRefreshing, XNRSigVoidNoArg,  NO,  "拦截+计数" },
+    { "endRefreshing",    (IMP)&XNRHookedEndRefreshing,   XNRSigVoidNoArg,  YES, "探针:刷新结束" },
+    { "setState:",        (IMP)&XNRHookedSetState,        XNRSigVoidIntArg, YES, "探针:状态被写" },
+    { "reloadData",       (IMP)&XNRHookedReloadData,      XNRSigVoidNoArg,  NO,  "探针:列表重载" },
 };
 #define XNR_GATE_COUNT (sizeof(gGateDefs) / sizeof(gGateDefs[0]))
 

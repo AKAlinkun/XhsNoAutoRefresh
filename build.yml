@@ -1,0 +1,61 @@
+name: Build XhsNoAutoRefresh
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      # ── 前置自检：在花 1 分钟装 Theos 之前，先把「低级编译错误」和「危险代码」揪出来 ──
+      # 起因：BiliNoAutoRefresh 曾因一行常量声明被误删而编译失败，clang 报错一大屏不好读。
+      # ★ 检查逻辑放在仓库里的 check_tweak.py —— 本地和 CI 共用【同一份】，避免两处规则漂移。
+      #   本机没有 iOS clang，每一次 CI 编译失败都要用户重跑「上传→下载→注入」（5~10 分钟），
+      #   所以这些静态检查的价值很高：能在装 Theos 之前就失败，并输出 ::error 注解（人话，带行号）。
+      - name: 静态自检
+        run: |
+          if [ -f check_tweak.py ]; then
+            python3 check_tweak.py --selftest   # ★ 先用反向测试证明"检查器本身是有效的"
+            python3 check_tweak.py              # 再用它检查代码
+          else
+            echo "::warning file=check_tweak.py::仓库里没有 check_tweak.py，跳过前置自检。建议把它一起上传（三个文件之一）。"
+          fi
+
+      # ── 安装 Theos：带自动重试 ──────────────────────────────────────────
+      # 上一个工程实测过：theos-action 内部的 `update-theos` 拉子模块 vendor/include 时
+      # 偶发连不上 github.com（"Failed to connect to github.com port 443 after 557 ms"）。
+      # 同一个 run 里其它子模块都拉成功 → 运行器瞬时网络抖动，与代码无关，重跑即可。
+      # 做法：第一次允许失败（continue-on-error，拿到 outcome），失败了就整步重来一次。
+      - name: 安装 Theos
+        id: theos1
+        continue-on-error: true
+        uses: waruhachi/theos-action@v2.6.3
+
+      - name: 安装 Theos（第 2 次尝试）
+        if: steps.theos1.outcome == 'failure'
+        uses: waruhachi/theos-action@v2.6.3
+
+      - name: 编译 dylib
+        run: make clean && make FINALPACKAGE=1
+
+      - name: 打包 deb（可选，失败不影响 dylib）
+        continue-on-error: true
+        run: make package FINALPACKAGE=1
+
+      - name: 收集产物
+        run: |
+          mkdir -p out
+          find .theos -name "*.dylib" -exec cp {} out/ \; || true
+          find packages -name "*.deb" -exec cp {} out/ \; || true
+          ls -lR out
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: XhsNoAutoRefresh
+          path: out/*
+          if-no-files-found: error
