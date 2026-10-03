@@ -1,0 +1,86 @@
+name: Build XhsNoAutoRefresh
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 静态自检
+        run: |
+          python3 - <<'PY'
+          import re, sys
+          raw = open("Tweak.x", "rb").read()
+          src = raw.decode("utf-8")
+          s = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+          s = re.sub(r"//[^\n]*", "", s)
+          code = re.sub(r'"(?:[^"\\]|\\.)*"', '""', s)
+          problems = []
+          for name in sorted(set(re.findall(r"\b([kg][A-Z]\w*)\b", code))):
+              if not re.search(r"\b" + name + r"\s*(=|;|\[)", s):
+                  ln = next((i + 1 for i, l in enumerate(s.splitlines())
+                             if re.search(r"\b" + name + r"\b", l)), 0)
+                  problems.append("常量 %s 被使用（第 %d 行）但没有定义" % (name, ln))
+          for pat, msg in [(r"^\s*%hook", "出现 Logos 钩子 %hook"),
+                           (r"#\s*import\s*[^\n]*substrate", "引用了 substrate 头文件"),
+                           (r"MSHookMessageEx|MSHookIvar", "调用了 substrate API")]:
+              if re.search(pat, src, re.M):
+                  problems.append(msg)
+          for pat, msg in [(r"setContentInset\s*:", "出现几何写入 setContentInset:"),
+                           (r"setContentOffset\s*:", "出现几何写入 setContentOffset:"),
+                           (r"setFrame\s*:", "出现几何写入 setFrame:")]:
+              if re.search(pat, code):
+                  problems.append(msg + "（v1.0.0 不允许）")
+          for pat, msg in [(r"endRefreshing", "出现代调 App 的语义 API endRefreshing（禁止）"),
+                           (r"setState\s*:", "出现 hook/写入刷新状态 setState:（禁止）")]:
+              if re.search(pat, code):
+                  problems.append(msg)
+          for op, cl in [("{", "}"), ("(", ")"), ("[", "]")]:
+              if code.count(op) != code.count(cl):
+                  problems.append("括号不平衡：%s=%d 但 %s=%d" % (op, code.count(op), cl, code.count(cl)))
+          if b"\r\n" in raw:
+              problems.append("检测到 CRLF 行尾符，必须转成 LF")
+          if raw[:3] == b"\xef\xbb\xbf":
+              problems.append("文件带 UTF-8 BOM，必须去掉")
+          if problems:
+              for p in problems:
+                  print("::error file=Tweak.x::" + p)
+              print("\n静态自检未通过，共 %d 个问题。" % len(problems))
+              sys.exit(1)
+          print("静态自检通过：常量齐全、无 Logos/substrate、零几何写入、括号平衡、LF 无 BOM ✓")
+          PY
+
+      - name: 安装 Theos
+        id: theos1
+        continue-on-error: true
+        uses: waruhachi/theos-action@v2.6.3
+
+      - name: 安装 Theos（第 2 次尝试）
+        if: steps.theos1.outcome == 'failure'
+        uses: waruhachi/theos-action@v2.6.3
+
+      - name: 编译 dylib
+        run: make clean && make FINALPACKAGE=1
+
+      - name: 打包 deb（可选，失败不影响 dylib）
+        continue-on-error: true
+        run: make package FINALPACKAGE=1
+
+      - name: 收集产物
+        run: |
+          mkdir -p out
+          find .theos -name "*.dylib" -exec cp {} out/ \; || true
+          find packages -name "*.deb" -exec cp {} out/ \; || true
+          ls -lR out
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: XhsNoAutoRefresh
+          path: out/*
+          if-no-files-found: error
